@@ -7,7 +7,7 @@ import signal
 import time
 from pathlib import Path
 
-from .config import load_config
+from .config import DEFAULT_CONFIG_PATH, load_config
 from .jobs import utc_iso
 from .runner import configured_paths, run_once
 
@@ -94,7 +94,7 @@ def daemon_loop(config_path: Path, interval_minutes: int | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--interval", type=int)
     args = parser.parse_args(argv)
     return daemon_loop(Path(args.config), args.interval)
@@ -102,4 +102,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

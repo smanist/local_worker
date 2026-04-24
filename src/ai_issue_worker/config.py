@@ -7,6 +7,9 @@ from typing import Any
 import yaml
 
 
+DEFAULT_CONFIG_PATH = ".ai-issue-worker.yaml"
+
+
 class ConfigError(ValueError):
     pass
 
@@ -48,7 +51,7 @@ class GitConfig:
 @dataclass
 class AgentConfig:
     backend: str = "codex"
-    command: str = "codex"
+    command: str = "codex exec --full-auto"
     timeout_minutes: int = 30
     max_repair_attempts: int = 1
 
@@ -168,4 +171,3 @@ def write_default_config(path: Path, force: bool = False) -> None:
     if path.exists() and not force:
         raise ConfigError(f"config already exists: {path}; use --force to overwrite")
     path.write_text(default_config_text(), encoding="utf-8")
-

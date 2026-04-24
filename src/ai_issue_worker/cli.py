@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .config import ConfigError, load_config, write_default_config
+from .config import DEFAULT_CONFIG_PATH, ConfigError, load_config, write_default_config
 from .daemon import pid_alive, read_json, write_status
 from .github_gh import GHClient, GHError
 from .issue_selection import candidate_issues
@@ -304,41 +304,41 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init")
-    init.add_argument("--path", default=".ai-issue-worker.yaml")
+    init.add_argument("--path", default=DEFAULT_CONFIG_PATH)
     init.add_argument("--force", action="store_true")
     init.set_defaults(func=cmd_init)
 
     run = sub.add_parser("run-once")
-    run.add_argument("--config", default=".ai-issue-worker.yaml")
+    run.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     run.set_defaults(func=cmd_run_once)
 
     list_cmd = sub.add_parser("list")
-    list_cmd.add_argument("--config", default=".ai-issue-worker.yaml")
+    list_cmd.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     list_cmd.add_argument("--json", action="store_true")
     list_cmd.set_defaults(func=cmd_list)
 
     inspect = sub.add_parser("inspect")
-    inspect.add_argument("--config", default=".ai-issue-worker.yaml")
+    inspect.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     inspect.add_argument("--issue", type=int)
     inspect.add_argument("--json", action="store_true")
     inspect.set_defaults(func=cmd_inspect)
 
     start = sub.add_parser("start")
-    start.add_argument("--config", default=".ai-issue-worker.yaml")
+    start.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     start.add_argument("--interval", dest="interval_minutes", type=parse_interval_minutes)
     start.add_argument("--foreground", action="store_true")
     start.set_defaults(func=cmd_start)
 
     stop = sub.add_parser("stop")
-    stop.add_argument("--config", default=".ai-issue-worker.yaml")
+    stop.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     stop.set_defaults(func=cmd_stop)
 
     status = sub.add_parser("status")
-    status.add_argument("--config", default=".ai-issue-worker.yaml")
+    status.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     status.set_defaults(func=cmd_status)
 
     logs = sub.add_parser("logs")
-    logs.add_argument("--config", default=".ai-issue-worker.yaml")
+    logs.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     logs.add_argument("--tail", type=int, default=100)
     logs.add_argument("--follow", action="store_true")
     logs.add_argument("--issue", type=int)
@@ -346,12 +346,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     retry = sub.add_parser("retry")
     retry.add_argument("issue", type=int)
-    retry.add_argument("--config", default=".ai-issue-worker.yaml")
+    retry.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     retry.add_argument("--run-now", action="store_true")
     retry.set_defaults(func=cmd_retry)
 
     clean = sub.add_parser("clean")
-    clean.add_argument("--config", default=".ai-issue-worker.yaml")
+    clean.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     clean.add_argument("--issue", type=int)
     clean.add_argument("--failed", action="store_true")
     clean.add_argument("--older-than")

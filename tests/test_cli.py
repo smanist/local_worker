@@ -25,3 +25,11 @@ def test_cli_list_smoke_with_fake_gh(tmp_path: Path, monkeypatch, capsys):
     assert cli.main(["list", "--config", str(path)]) == 0
     assert "#1" in capsys.readouterr().out
 
+
+def test_cli_list_defaults_to_dotfile_config(tmp_path: Path, monkeypatch, capsys):
+    path = tmp_path / ".ai-issue-worker.yaml"
+    path.write_text("repo: owner/repo\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "GHClient", FakeGH)
+    assert cli.main(["list"]) == 0
+    assert "#1" in capsys.readouterr().out

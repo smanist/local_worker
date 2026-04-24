@@ -17,7 +17,7 @@ class CodexBackend(AgentBackend):
     def run(self, worktree_path: Path, prompt_path: Path, timeout_sec: int) -> AgentResult:
         prompt = prompt_path.read_text(encoding="utf-8")
         started = time.monotonic()
-        args = shlex.split(self.command)
+        args = codex_command_args(self.command)
         result = run_cmd(args, cwd=worktree_path, timeout=timeout_sec, input_text=prompt)
         duration = time.monotonic() - started
         timed_out = result.exit_code == 124
@@ -36,3 +36,11 @@ class CodexBackend(AgentBackend):
             timed_out=timed_out,
         )
 
+
+def codex_command_args(command: str) -> list[str]:
+    args = shlex.split(command)
+    if args == ["codex"]:
+        return ["codex", "exec", "--full-auto", "-"]
+    if len(args) >= 2 and args[0] == "codex" and args[1] == "exec" and "-" not in args:
+        return [*args, "-"]
+    return args

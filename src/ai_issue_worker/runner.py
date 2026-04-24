@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 
 from .codex_backend import CodexBackend
-from .config import ConfigError, WorkerConfig, load_config
+from .config import ConfigError, IssueSelectionConfig, WorkerConfig, load_config
 from .diff_policy import inspect_diff
 from .github_gh import GHClient, GHError
 from .issue_selection import candidate_issues, select_one_issue
@@ -148,6 +148,27 @@ def _record_for(issue: Issue, branch: str, worktree_path: Path) -> JobRecord:
         changed_files=[],
         verifier_passed=None,
     )
+
+
+def _has_open_blockers(gh: GHClient, issue: Issue) -> bool:
+    return any(blocker.state.lower() == "open" for blocker in gh.blocked_by(issue.number))
+
+
+def workable_issues(gh: GHClient, issues: list[Issue], config: IssueSelectionConfig) -> list[Issue]:
+    candidates = candidate_issues(issues, config)
+    if not config.respect_issue_dependencies:
+        return candidates
+    return [issue for issue in candidates if not _has_open_blockers(gh, issue)]
+
+
+def select_workable_issue(gh: GHClient, issues: list[Issue], config: IssueSelectionConfig) -> Issue | None:
+    candidates = candidate_issues(issues, config)
+    if not config.respect_issue_dependencies:
+        return select_one_issue(candidates, config)
+    for issue in candidates:
+        if not _has_open_blockers(gh, issue):
+            return issue
+    return None
 
 
 def blocking_review_priorities(review_output: str, blocking_priorities: list[str]) -> list[str]:
@@ -468,8 +489,7 @@ def run_once(config_path: Path, repo_root: Path | None = None, overrides: RunOve
             gh = GHClient(config.repo)
             try:
                 issues = gh.list_issues(config.issue_selection.ready_label)
-                candidates = candidate_issues(issues, config.issue_selection)
-                issue = select_one_issue(candidates, config.issue_selection)
+                issue = select_workable_issue(gh, issues, config.issue_selection)
                 if issue is None:
                     return EXIT_OK
                 issue = gh.view_issue(issue.number)

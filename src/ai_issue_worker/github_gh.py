@@ -15,6 +15,16 @@ class GHClient:
     def __init__(self, repo: str):
         self.repo = repo
 
+    def _api_repo_args(self) -> tuple[list[str], str]:
+        parts = self.repo.split("/")
+        if len(parts) == 2:
+            owner, repo = parts
+            return [], f"repos/{owner}/{repo}"
+        if len(parts) == 3:
+            host, owner, repo = parts
+            return ["--hostname", host], f"repos/{owner}/{repo}"
+        raise GHError("repo must be in owner/repo or host/owner/repo form")
+
     def _run(self, args: list[str]):
         result = run_cmd(args)
         if result.exit_code != 0:
@@ -57,6 +67,25 @@ class GHClient:
             ]
         )
         return Issue.from_gh(json.loads(result.stdout))
+
+    def blocked_by(self, number: int) -> list[Issue]:
+        hostname_args, repo_path = self._api_repo_args()
+        result = self._run(
+            [
+                "gh",
+                "api",
+                *hostname_args,
+                f"{repo_path}/issues/{number}/dependencies/blocked_by",
+                "--paginate",
+                "--slurp",
+            ]
+        )
+        data = json.loads(result.stdout or "[]")
+        if data and all(isinstance(page, list) for page in data):
+            items = [item for page in data for item in page]
+        else:
+            items = data
+        return [Issue.from_gh(item) for item in items]
 
     def add_label(self, number: int, label: str) -> None:
         self._run(["gh", "issue", "edit", str(number), "--repo", self.repo, "--add-label", label])

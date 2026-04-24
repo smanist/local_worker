@@ -3,7 +3,7 @@ from pathlib import Path
 
 from ai_issue_worker.config import config_from_dict
 from ai_issue_worker.models import AgentResult, CommandResult, DiffSummary, Issue, VerifyResult
-from ai_issue_worker.runner import _diff_snapshot, _run_agent_and_verify, blocking_review_priorities
+from ai_issue_worker.runner import _diff_snapshot, _run_agent_and_verify, blocking_review_priorities, select_workable_issue
 
 
 def _issue() -> Issue:
@@ -12,6 +12,16 @@ def _issue() -> Issue:
 
 def _diff() -> DiffSummary:
     return DiffSummary(["src/app.py"], " src/app.py | 2 +-", 2, False, None)
+
+
+class FakeDependencyGH:
+    def __init__(self, blockers_by_issue: dict[int, list[Issue]]):
+        self.blockers_by_issue = blockers_by_issue
+        self.checked: list[int] = []
+
+    def blocked_by(self, number: int) -> list[Issue]:
+        self.checked.append(number)
+        return self.blockers_by_issue.get(number, [])
 
 
 def test_blocking_review_priorities_prefers_structured_line():
@@ -24,6 +34,43 @@ def test_blocking_review_priorities_fallback_ignores_plain_no_p0_p1_text():
     review = "No P0/P1 findings found.\n\n[P2] Optional cleanup"
 
     assert blocking_review_priorities(review, ["P0", "P1"]) == []
+
+
+def test_select_workable_issue_skips_candidates_with_open_blockers():
+    config = config_from_dict({"repo": "owner/repo"}).issue_selection
+    issues = [
+        Issue(1, "Blocked", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z"),
+        Issue(2, "Ready", "", ["ai-ready"], "open", updated_at="2026-01-02T00:00:00Z"),
+    ]
+    gh = FakeDependencyGH({1: [Issue(10, "Blocker", "", [], "open")]})
+
+    issue = select_workable_issue(gh, issues, config)
+
+    assert issue and issue.number == 2
+    assert gh.checked == [1, 2]
+
+
+def test_select_workable_issue_allows_candidates_with_closed_blockers():
+    config = config_from_dict({"repo": "owner/repo"}).issue_selection
+    issues = [Issue(1, "Unblocked", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
+    gh = FakeDependencyGH({1: [Issue(10, "Done blocker", "", [], "closed")]})
+
+    issue = select_workable_issue(gh, issues, config)
+
+    assert issue and issue.number == 1
+
+
+def test_select_workable_issue_can_ignore_dependency_checks():
+    config = config_from_dict(
+        {"repo": "owner/repo", "issue_selection": {"respect_issue_dependencies": False}}
+    ).issue_selection
+    issues = [Issue(1, "Blocked but selected", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
+    gh = FakeDependencyGH({1: [Issue(10, "Blocker", "", [], "open")]})
+
+    issue = select_workable_issue(gh, issues, config)
+
+    assert issue and issue.number == 1
+    assert gh.checked == []
 
 
 def test_run_agent_review_fix_loop_until_clean(monkeypatch, tmp_path: Path):

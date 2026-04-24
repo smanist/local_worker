@@ -2,7 +2,7 @@ from pathlib import Path
 
 from ai_issue_worker.config import config_from_dict
 from ai_issue_worker.models import CommandResult, DiffSummary, Issue, VerifyResult
-from ai_issue_worker.prompt import build_prompt, build_review_fix_prompt, build_review_prompt
+from ai_issue_worker.prompt import build_issue_draft_prompt, build_prompt, build_review_fix_prompt, build_review_prompt
 
 
 def test_prompt_contains_issue_and_constraints(tmp_path: Path):
@@ -48,3 +48,17 @@ def test_review_fix_prompt_targets_only_blocking_findings():
     assert "Fix only review findings with these priorities: P1" in prompt
     assert "Do not address findings with other priorities" in prompt
     assert "Do not commit changes" in prompt
+
+
+def test_issue_draft_prompt_requires_json_output(tmp_path: Path):
+    config = config_from_dict({"repo": "owner/repo"})
+    (tmp_path / "README.md").write_text("Parser project.", encoding="utf-8")
+
+    prompt = build_issue_draft_prompt("parser crashes on empty input", tmp_path, config, title_hint="Parser crash on empty input")
+
+    assert "Return only valid JSON" in prompt
+    assert '"title"' in prompt
+    assert '"body"' in prompt
+    assert "parser crashes on empty input" in prompt
+    assert "Title hint: Parser crash on empty input" in prompt
+    assert "Parser project." in prompt

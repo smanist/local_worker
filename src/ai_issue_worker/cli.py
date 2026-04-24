@@ -14,12 +14,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .config import DEFAULT_CONFIG_PATH, REASONING_EFFORTS, ConfigError, load_config, write_default_config
+from .codex_backend import CodexBackend
 from .daemon import pid_alive, read_json, write_status
 from .github_gh import GHClient, GHError
-from .issue_selection import candidate_issues
 from .jobs import issue_run_dir, recent_jobs
 from .locking import lock_status
-from .runner import RunOverrides, configured_paths, run_once
+from .prompt import build_issue_draft_prompt
+from .runner import RunOverrides, configured_paths, run_once, workable_issues
 from .shell import run_cmd
 from .worktree import GitError, remove_worktree
 
@@ -78,25 +79,63 @@ def _derive_issue_title(description: str, title: str | None) -> str:
     return first[:120].rstrip(" .")
 
 
-def _issue_markdown(description: str) -> str:
-    description = description.strip()
-    return f"""## Summary
+def _strip_code_fence(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        lines = stripped.splitlines()
+        if len(lines) >= 3:
+            return "\n".join(lines[1:-1]).strip()
+    return stripped
 
-{description}
 
-## Expected outcome
+def _parse_issue_draft_json(text: str) -> tuple[str, str]:
+    stripped = _strip_code_fence(text)
+    candidates = [stripped]
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(stripped[start : end + 1])
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        title = data.get("title")
+        body = data.get("body")
+        if isinstance(title, str) and isinstance(body, str):
+            return title.strip(), body.strip()
+    raise RuntimeError("agent did not return valid issue draft JSON")
 
-- 
 
-## Acceptance criteria
+def _render_issue_draft(title: str, body: str) -> str:
+    body = body.strip()
+    return f"""Title: {title.strip()}
 
-- [ ] 
-
-## Notes for the AI worker
-
-- Keep the change focused on this issue.
-- Add or update tests when appropriate.
+{body}
 """
+
+
+def _parse_issue_draft_file(text: str) -> tuple[str, str]:
+    lines = text.splitlines()
+    title = ""
+    body_start = 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("<!--"):
+            continue
+        if stripped.lower().startswith("title:"):
+            title = stripped.split(":", 1)[1].strip()
+            body_start = index + 1
+            break
+        raise ConfigError("draft must start with a `Title:` line")
+    body = "\n".join(lines[body_start:]).strip()
+    if not title:
+        raise ConfigError("issue title is empty after editing; aborting")
+    if not body:
+        raise ConfigError("issue body is empty after editing; aborting")
+    return title, body
 
 
 def _read_description(args) -> str:
@@ -128,6 +167,30 @@ def _run_editor(path: Path, editor: str | None = None) -> None:
         raise RuntimeError(f"editor exited with status {result.returncode}")
 
 
+def _generate_issue_draft(config, repo_root: Path, description: str, title_hint: str, draft_dir: Path) -> tuple[str, str]:
+    prompt_path = draft_dir / "issue-draft.prompt.md"
+    log_path = draft_dir / "issue-draft.log"
+    prompt_path.write_text(build_issue_draft_prompt(description, repo_root, config, title_hint=title_hint), encoding="utf-8")
+    backend = CodexBackend(
+        config.agent.command,
+        log_path=log_path,
+        model=config.agent.model,
+        reasoning=config.agent.reasoning,
+    )
+    result = backend.run(repo_root, prompt_path, timeout_sec=config.agent.timeout_minutes * 60)
+    if not result.success:
+        detail = result.stderr.strip() or result.stdout.strip() or "agent failed without output"
+        raise RuntimeError(f"issue draft generation failed: {detail}")
+    title, body = _parse_issue_draft_json(result.stdout)
+    if not title:
+        title = title_hint.strip()
+    if not title:
+        raise RuntimeError("agent returned an empty issue title")
+    if not body:
+        raise RuntimeError("agent returned an empty issue body")
+    return title, body
+
+
 def cmd_init(args) -> int:
     try:
         write_default_config(Path(args.path), force=args.force)
@@ -141,8 +204,9 @@ def cmd_init(args) -> int:
 def cmd_list(args) -> int:
     try:
         config = _load(args.config)
-        issues = GHClient(config.repo).list_issues(config.issue_selection.ready_label)
-        candidates = candidate_issues(issues, config.issue_selection)
+        gh = GHClient(config.repo)
+        issues = gh.list_issues(config.issue_selection.ready_label)
+        candidates = workable_issues(gh, issues, config.issue_selection)
     except (ConfigError, GHError) as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -160,21 +224,21 @@ def cmd_create(args) -> int:
         description = _read_description(args).strip()
         if not description:
             raise ConfigError("issue description is required; pass text, --description-file, or pipe stdin")
-        title = _derive_issue_title(description, args.title)
-        if not title:
-            raise ConfigError("issue title is required; pass --title or start the description with a title line")
-        body = _issue_markdown(description)
+        title_hint = _derive_issue_title(description, args.title)
         draft_dir = Path(tempfile.mkdtemp(prefix="ai-issue-create-"))
-        body_file = draft_dir / "issue.md"
+        draft_file = draft_dir / "issue.md"
         try:
-            body_file.write_text(body, encoding="utf-8")
+            title, body = _generate_issue_draft(config, Path.cwd(), description, title_hint, draft_dir)
+            draft_file.write_text(_render_issue_draft(title, body), encoding="utf-8")
             if not args.no_edit:
-                _run_editor(body_file, args.editor)
-            edited_body = body_file.read_text(encoding="utf-8").strip()
-            if not edited_body:
-                raise ConfigError("issue body is empty after editing; aborting")
-            body_file.write_text(f"{edited_body}\n", encoding="utf-8")
-            url = GHClient(config.repo).create_issue(title, body_file, labels=[config.issue_selection.ready_label])
+                _run_editor(draft_file, args.editor)
+            edited_title, edited_body = _parse_issue_draft_file(draft_file.read_text(encoding="utf-8"))
+            draft_file.write_text(f"{edited_body}\n", encoding="utf-8")
+            url = GHClient(config.repo).create_issue(
+                edited_title,
+                draft_file,
+                labels=[config.issue_selection.ready_label],
+            )
         finally:
             shutil.rmtree(draft_dir, ignore_errors=True)
     except (ConfigError, GHError, RuntimeError) as exc:

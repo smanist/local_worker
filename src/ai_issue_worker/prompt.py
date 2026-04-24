@@ -68,6 +68,43 @@ A modified working tree that addresses the issue.
 """
 
 
+def build_issue_draft_prompt(description: str, repo_root: Path, config: WorkerConfig, title_hint: str | None = None) -> str:
+    title_note = f"- Title hint: {title_hint}\n" if title_hint else ""
+    return f"""# Task
+
+You are drafting a GitHub issue for repository `{config.repo}` from rough local notes.
+
+Turn the rough notes into a concise, implementation-ready GitHub issue.
+
+## Rough notes
+
+{description}
+
+## Requirements
+
+- Return only valid JSON. Do not wrap it in markdown fences.
+- The JSON object must contain exactly two string fields: `title` and `body`.
+- Output shape: {{"title": "...", "body": "..."}}
+- `title` should be concise and specific.
+- `body` must be GitHub-flavored Markdown without a top-level title heading.
+- Make the issue concrete enough for an engineering agent to act on.
+- Preserve uncertainty explicitly instead of inventing facts.
+- Keep the body focused and not verbose.
+{title_note}
+## Desired body structure
+
+- `## Summary`
+- `## Problem`
+- `## Expected outcome`
+- `## Acceptance criteria`
+- `## Notes`
+
+## Repository instructions
+
+{repository_instructions(repo_root)}
+"""
+
+
 def build_repair_prompt(issue: Issue, verify_logs: str, diff_summary: DiffSummary) -> str:
     return f"""# Repair task
 

@@ -35,6 +35,7 @@ class IssueSelectionConfig:
     failed_label: str = "ai-failed"
     pr_opened_label: str = "ai-pr-opened"
     blocked_labels: list[str] = field(default_factory=lambda: ["blocked", "needs-human"])
+    respect_issue_dependencies: bool = True
     max_issues_per_run: int = 1
     selection_order: str = "oldest_updated"
 

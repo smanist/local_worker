@@ -34,15 +34,28 @@ List candidate issues:
 ai-issue list
 ```
 
-Create a new AI-ready issue from a local description. The command drafts a
-Markdown issue body, opens it in your editor, then creates the GitHub issue with
-the configured ready label:
+By default, candidates exclude issues that have open native GitHub issue
+dependencies in their `blocked by` relationship, in addition to excluding
+configured blocked labels such as `blocked` and `needs-human`.
+
+To use label-only selection, disable the dependency check:
+
+```yaml
+issue_selection:
+  respect_issue_dependencies: false
+```
+
+Create a new AI-ready issue from rough local notes. The command sends your notes
+through the configured Codex agent to draft a formal title and Markdown body,
+opens that draft in your editor, then creates the GitHub issue with the
+configured ready label:
 
 ```bash
 ai-issue create --title "Fix parser crash" "Parser crashes when input is empty."
 ```
 
-Use `--description-file path/to/issue.txt` for longer descriptions, or
+It uses the same `agent.command`, `agent.model`, and `agent.reasoning` settings
+as the worker. Use `--description-file path/to/issue.txt` for longer notes, or
 `--no-edit` for non-interactive scripts.
 
 Run one local cycle:

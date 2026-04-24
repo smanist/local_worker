@@ -11,6 +11,9 @@ class FakeGH:
     def list_issues(self, ready_label: str):
         return [Issue(1, "Ready", "", [ready_label], "open", updated_at="2026-01-01T00:00:00Z")]
 
+    def blocked_by(self, number: int):
+        return []
+
 
 def test_cli_init_smoke(tmp_path: Path):
     path = tmp_path / "config.yaml"
@@ -71,15 +74,22 @@ def test_cli_create_issue_uses_ready_label_and_generated_body(tmp_path: Path, mo
             captured["labels"] = labels
             return "https://github.com/owner/repo/issues/123"
 
+    monkeypatch.setattr(
+        cli,
+        "_generate_issue_draft",
+        lambda config, repo_root, description, title_hint, draft_dir: (
+            "Generated parser failure title",
+            "## Summary\n\nGenerated body.\n",
+        ),
+    )
     monkeypatch.setattr(cli, "GHClient", FakeCreateGH)
-    result = cli.main(["create", "--config", str(path), "--title", "Broken parser", "--no-edit", "Parser fails on empty input"])
+    result = cli.main(["create", "--config", str(path), "--no-edit", "Parser fails on empty input"])
 
     assert result == 0
     assert captured["repo"] == "owner/repo"
-    assert captured["title"] == "Broken parser"
+    assert captured["title"] == "Generated parser failure title"
     assert captured["labels"] == ["ai-ready"]
-    assert "## Summary" in captured["body"]
-    assert "Parser fails on empty input" in captured["body"]
+    assert captured["body"] == "## Summary\n\nGenerated body.\n"
     assert "created issue: https://github.com/owner/repo/issues/123" in capsys.readouterr().out
 
 
@@ -98,9 +108,20 @@ def test_cli_create_issue_derives_title_and_runs_editor(tmp_path: Path, monkeypa
             captured["labels"] = labels
             return "https://github.com/owner/repo/issues/124"
 
+    monkeypatch.setattr(
+        cli,
+        "_generate_issue_draft",
+        lambda config, repo_root, description, title_hint, draft_dir: (
+            "Initial generated title",
+            "## Summary\n\nInitial generated body.\n",
+        ),
+    )
+
     def fake_editor(body_file: Path, editor: str | None = None):
-        existing = body_file.read_text(encoding="utf-8")
-        body_file.write_text(f"{existing}\nEdited in editor.\n", encoding="utf-8")
+        body_file.write_text(
+            "Title: Edited title\n\n## Summary\n\nEdited in editor.\n",
+            encoding="utf-8",
+        )
 
     monkeypatch.setattr(cli, "GHClient", FakeCreateGH)
     monkeypatch.setattr(cli, "_run_editor", fake_editor)
@@ -108,6 +129,15 @@ def test_cli_create_issue_derives_title_and_runs_editor(tmp_path: Path, monkeypa
     result = cli.main(["create", "--config", str(path), "Fix parser crash", "when input is empty"])
 
     assert result == 0
-    assert captured["title"] == "Fix parser crash when input is empty"
+    assert captured["title"] == "Edited title"
     assert captured["labels"] == ["ai-ready"]
-    assert "Edited in editor." in captured["body"]
+    assert captured["body"] == "## Summary\n\nEdited in editor.\n"
+
+
+def test_parse_issue_draft_file_requires_title_line():
+    try:
+        cli._parse_issue_draft_file("## Summary\n\nBody")
+    except cli.ConfigError as exc:
+        assert "Title:" in str(exc)
+    else:
+        raise AssertionError("expected ConfigError")

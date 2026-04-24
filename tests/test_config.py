@@ -11,6 +11,7 @@ def test_default_config_generation_works(tmp_path: Path):
     config = load_config(path)
     assert config.repo == "owner/repo"
     assert config.issue_selection.ready_label == "ai-ready"
+    assert config.issue_selection.respect_issue_dependencies is True
     assert config.agent.model == "gpt-5.4"
     assert config.agent.reasoning == "high"
     assert config.review.enabled is True
@@ -47,6 +48,12 @@ def test_config_accepts_review_overrides():
     assert config.review.enabled is False
     assert config.review.max_iterations == 2
     assert config.review.fix_priorities == ["P1"]
+
+
+def test_config_accepts_disabling_issue_dependency_selection():
+    config = config_from_dict({"repo": "owner/repo", "issue_selection": {"respect_issue_dependencies": False}})
+
+    assert config.issue_selection.respect_issue_dependencies is False
 
 
 def test_config_rejects_invalid_review_max_iterations():

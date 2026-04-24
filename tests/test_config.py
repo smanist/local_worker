@@ -13,6 +13,10 @@ def test_default_config_generation_works(tmp_path: Path):
     assert config.issue_selection.ready_label == "ai-ready"
     assert config.agent.model == "gpt-5.4"
     assert config.agent.reasoning == "high"
+    assert config.review.enabled is True
+    assert config.review.command == "codex exec --sandbox read-only"
+    assert config.review.max_iterations == 3
+    assert config.review.fix_priorities == ["P0", "P1"]
 
 
 def test_config_missing_repo_fails_clearly():
@@ -34,6 +38,25 @@ def test_config_accepts_legacy_reasoning_effort():
 def test_config_rejects_unknown_reasoning():
     with pytest.raises(ConfigError, match="reasoning"):
         config_from_dict({"repo": "owner/repo", "agent": {"reasoning": "max"}})
+
+
+def test_config_accepts_review_overrides():
+    config = config_from_dict(
+        {"repo": "owner/repo", "review": {"enabled": False, "max_iterations": 2, "fix_priorities": ["P1"]}}
+    )
+    assert config.review.enabled is False
+    assert config.review.max_iterations == 2
+    assert config.review.fix_priorities == ["P1"]
+
+
+def test_config_rejects_invalid_review_max_iterations():
+    with pytest.raises(ConfigError, match="review.max_iterations"):
+        config_from_dict({"repo": "owner/repo", "review": {"max_iterations": 0}})
+
+
+def test_config_rejects_invalid_review_priority():
+    with pytest.raises(ConfigError, match="review.fix_priorities"):
+        config_from_dict({"repo": "owner/repo", "review": {"fix_priorities": ["P2"]}})
 
 
 def test_init_refuses_overwrite_without_force(tmp_path: Path):

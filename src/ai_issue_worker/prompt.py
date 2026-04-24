@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from .config import WorkerConfig
-from .models import DiffSummary, Issue
+from .models import DiffSummary, Issue, VerifyResult
+from .verifier import format_verification_summary
 
 
 MAX_INSTRUCTION_CHARS = 12_000
@@ -91,3 +92,105 @@ Do not revert unrelated useful changes unless needed.
 Do not commit changes.
 """
 
+
+def build_review_prompt(issue: Issue, config: WorkerConfig, repo_root: Path, diff_summary: DiffSummary, verify: VerifyResult) -> str:
+    blocking = ", ".join(config.review.fix_priorities)
+    blocking_examples = list(config.review.fix_priorities)
+    if len(config.review.fix_priorities) > 1:
+        blocking_examples.append(",".join(config.review.fix_priorities))
+    output_examples = "\nor\n".join(f"`BLOCKING_PRIORITIES: {priority}`" for priority in blocking_examples)
+    return f"""# Code review task
+
+You are a separate Codex code-review session for repository `{config.repo}`.
+
+Review the current working tree changes for GitHub issue #{issue.number}. Do not edit files.
+
+## Issue title
+
+{issue.title}
+
+## Issue body
+
+{issue.body}
+
+## Current git diff summary
+
+Changed files:
+{chr(10).join(diff_summary.changed_files)}
+
+Diff stat:
+{diff_summary.diff_stat}
+
+## Verification summary
+
+{format_verification_summary(verify)}
+
+## Review scope
+
+- Look for correctness bugs, behavioral regressions, data loss risks, security issues, and critical missing tests.
+- Prioritize findings as P0, P1, P2, or P3.
+- Treat only {blocking} as blocking for the automated fixer loop.
+- Do not report speculative issues.
+- Do not edit files, commit changes, create branches, or open pull requests.
+
+## Output format
+
+Start with exactly one line:
+`BLOCKING_PRIORITIES: NONE`
+or
+{output_examples}
+
+Then list findings. Use this format for each finding:
+
+`[P1] Short title`
+File/line:
+Problem:
+Fix:
+
+If there are no findings, say so after the `BLOCKING_PRIORITIES: NONE` line.
+
+## Repository instructions
+
+{repository_instructions(repo_root)}
+"""
+
+
+def build_review_fix_prompt(
+    issue: Issue,
+    review_output: str,
+    diff_summary: DiffSummary,
+    fix_priorities: list[str],
+) -> str:
+    blocking = ", ".join(fix_priorities)
+    return f"""# Review fix task
+
+A separate Codex code-review session found blocking issues in the current implementation for GitHub issue #{issue.number}.
+
+## Issue title
+
+{issue.title}
+
+## Issue body
+
+{issue.body}
+
+## Blocking review output
+
+{review_output[-12000:]}
+
+## Current git diff summary
+
+Changed files:
+{chr(10).join(diff_summary.changed_files)}
+
+Diff stat:
+{diff_summary.diff_stat}
+
+## Instructions
+
+- Fix only review findings with these priorities: {blocking}.
+- Keep the changes minimal and targeted.
+- Do not address findings with other priorities unless required to fix a configured blocking issue.
+- Do not revert unrelated useful changes unless needed.
+- Do not commit changes, create branches, or open pull requests.
+"""

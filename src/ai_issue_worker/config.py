@@ -60,6 +60,14 @@ class AgentConfig:
 
 
 @dataclass
+class ReviewConfig:
+    enabled: bool = True
+    command: str = "codex exec --sandbox read-only"
+    max_iterations: int = 3
+    fix_priorities: list[str] = field(default_factory=lambda: ["P0", "P1"])
+
+
+@dataclass
 class VerifyConfig:
     commands: list[str] = field(
         default_factory=lambda: ["ruff check .", "ruff format --check .", "pyright", "pytest"]
@@ -101,6 +109,7 @@ class WorkerConfig:
     issue_selection: IssueSelectionConfig = field(default_factory=IssueSelectionConfig)
     git: GitConfig = field(default_factory=GitConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    review: ReviewConfig = field(default_factory=ReviewConfig)
     verify: VerifyConfig = field(default_factory=VerifyConfig)
     diff_policy: DiffPolicyConfig = field(default_factory=DiffPolicyConfig)
     pr: PRConfig = field(default_factory=PRConfig)
@@ -125,6 +134,7 @@ def default_config_dict(repo: str = "owner/repo") -> dict[str, Any]:
         "issue_selection": IssueSelectionConfig().__dict__,
         "git": GitConfig().__dict__,
         "agent": AgentConfig().__dict__,
+        "review": ReviewConfig().__dict__,
         "verify": VerifyConfig().__dict__,
         "diff_policy": DiffPolicyConfig().__dict__,
         "pr": PRConfig().__dict__,
@@ -149,6 +159,7 @@ def config_from_dict(data: dict[str, Any]) -> WorkerConfig:
         issue_selection=IssueSelectionConfig(**raw["issue_selection"]),
         git=GitConfig(**raw["git"]),
         agent=AgentConfig(**raw["agent"]),
+        review=ReviewConfig(**raw["review"]),
         verify=VerifyConfig(**raw["verify"]),
         diff_policy=DiffPolicyConfig(**raw["diff_policy"]),
         pr=PRConfig(**raw["pr"]),
@@ -156,6 +167,11 @@ def config_from_dict(data: dict[str, Any]) -> WorkerConfig:
     if config.agent.reasoning and config.agent.reasoning not in REASONING_EFFORTS:
         allowed = ", ".join(REASONING_EFFORTS)
         raise ConfigError(f"agent.reasoning must be one of: {allowed}")
+    if config.review.max_iterations < 1:
+        raise ConfigError("review.max_iterations must be at least 1")
+    invalid_priorities = [priority for priority in config.review.fix_priorities if priority not in {"P0", "P1"}]
+    if invalid_priorities:
+        raise ConfigError("review.fix_priorities must contain only P0 or P1")
     return config
 
 

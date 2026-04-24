@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import re
 import shlex
 import shutil
 from pathlib import Path
@@ -13,7 +15,7 @@ from .jobs import issue_run_dir, utc_iso, utc_timestamp, write_job_record, write
 from .locking import FileLock, LockHeld
 from .models import DiffSummary, Issue, JobRecord, VerifyResult
 from .pr import build_pr_body, render_template
-from .prompt import build_prompt, build_repair_prompt
+from .prompt import build_prompt, build_repair_prompt, build_review_fix_prompt, build_review_prompt
 from .shell import run_cmd
 from .verifier import format_verification_summary, run_verifier
 from .worktree import GitError, add_worktree, commit_all, push_branch, remove_worktree, unique_branch_name
@@ -29,6 +31,8 @@ EXIT_AGENT = 5
 EXIT_VERIFY = 6
 EXIT_PR = 7
 EXIT_LOCK = 8
+
+REVIEW_FINDING_RE = re.compile(r"^\s*(?:[-*]\s*)?(?:\[(P[0-3])\]|(P[0-3])\s*[:\-])", re.MULTILINE)
 
 
 class DependencyError(RuntimeError):
@@ -78,6 +82,8 @@ def check_dependencies(config: WorkerConfig, root: Path | None = None, paths: di
         ["git", "--version"],
         [*shlex.split(config.agent.command), "--version"],
     ]
+    if config.review.enabled:
+        checks.append([*shlex.split(config.review.command), "--version"])
     for check in checks:
         result = run_cmd(check)
         if result.exit_code != 0:
@@ -144,33 +150,73 @@ def _record_for(issue: Issue, branch: str, worktree_path: Path) -> JobRecord:
     )
 
 
-def _run_agent_and_verify(
-    config: WorkerConfig,
-    issue: Issue,
-    repo_root: Path,
-    worktree_path: Path,
-    run_dir: Path,
-    stamp: str,
-) -> tuple[bool, VerifyResult | None, DiffSummary, str]:
-    prompt_text = build_prompt(issue, config, repo_root)
-    prompt_path = run_dir / f"prompt-{stamp}.md"
-    write_text_artifact(prompt_path, run_dir / "prompt.md", prompt_text)
+def blocking_review_priorities(review_output: str, blocking_priorities: list[str]) -> list[str]:
+    blocking = set(blocking_priorities)
+    for line in review_output.splitlines():
+        if line.strip().upper().startswith("BLOCKING_PRIORITIES:"):
+            value = line.split(":", 1)[1].strip().upper()
+            if value in {"", "NONE", "NO", "N/A"}:
+                return []
+            found = [priority for priority in re.findall(r"P[0-3]", value) if priority in blocking]
+            return sorted(set(found), key=found.index)
 
-    codex_log = run_dir / f"codex-{stamp}.log"
+    matches: list[str] = []
+    for match in REVIEW_FINDING_RE.finditer(review_output):
+        priority = match.group(1) or match.group(2)
+        if priority in blocking and priority not in matches:
+            matches.append(priority)
+    return matches
+
+
+def _run_codex_session(
+    config: WorkerConfig,
+    worktree_path: Path,
+    prompt_path: Path,
+    log_path: Path,
+    command: str | None = None,
+):
     backend = CodexBackend(
-        config.agent.command,
-        codex_log,
+        command or config.agent.command,
+        log_path,
         model=config.agent.model,
         reasoning=config.agent.reasoning,
     )
-    agent = backend.run(worktree_path, prompt_path, timeout_sec=config.agent.timeout_minutes * 60)
-    shutil.copyfile(codex_log, run_dir / "codex.log")
-    if not agent.success:
-        return False, None, inspect_diff(worktree_path, config.diff_policy), (
-            f"Agent failed with exit code {agent.exit_code}."
-            f"\n\nstdout:\n{agent.stdout[-2000:]}\n\nstderr:\n{agent.stderr[-2000:]}"
-        )
+    result = backend.run(worktree_path, prompt_path, timeout_sec=config.agent.timeout_minutes * 60)
+    if log_path.exists():
+        shutil.copyfile(log_path, log_path.parent / "codex.log")
+    return result
 
+
+def _diff_snapshot(worktree_path: Path) -> str:
+    status = run_cmd(["git", "status", "--porcelain"], cwd=worktree_path)
+    result = run_cmd(["git", "diff", "--binary", "HEAD"], cwd=worktree_path)
+    untracked = run_cmd(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=worktree_path)
+    ignored = run_cmd(["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"], cwd=worktree_path)
+    status_text = status.stdout if status.exit_code == 0 else ""
+    diff_text = result.stdout if result.exit_code == 0 else ""
+    untracked_parts: list[str] = []
+    untracked_names: set[str] = set()
+    if untracked.exit_code == 0:
+        untracked_names.update(path for path in untracked.stdout.split("\0") if path)
+    if ignored.exit_code == 0:
+        untracked_names.update(path for path in ignored.stdout.split("\0") if path)
+    for name in sorted(untracked_names):
+        path = worktree_path / name
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
+        except OSError:
+            digest = ""
+        untracked_parts.append(f"{name}\0{digest}")
+    return f"{status_text}\0{diff_text}\0{chr(0).join(untracked_parts)}"
+
+
+def _run_verification_with_repairs(
+    config: WorkerConfig,
+    issue: Issue,
+    worktree_path: Path,
+    run_dir: Path,
+    stamp: str,
+) -> tuple[bool, VerifyResult, DiffSummary, str, str]:
     verify_log = run_dir / f"verify-{stamp}.log"
     verify = run_verifier(config.verify, worktree_path, verify_log)
     latest_verify = run_dir / "verify.log"
@@ -184,22 +230,126 @@ def _run_agent_and_verify(
         repair_prompt = build_repair_prompt(issue, verify_log.read_text(encoding="utf-8"), diff)
         repair_prompt_path = run_dir / f"prompt-{repair_stamp}.md"
         write_text_artifact(repair_prompt_path, run_dir / "prompt.md", repair_prompt)
-        backend = CodexBackend(
-            config.agent.command,
+        repair = _run_codex_session(
+            config,
+            worktree_path,
+            repair_prompt_path,
             run_dir / f"codex-{repair_stamp}.log",
-            model=config.agent.model,
-            reasoning=config.agent.reasoning,
         )
-        repair = backend.run(worktree_path, repair_prompt_path, timeout_sec=config.agent.timeout_minutes * 60)
-        shutil.copyfile(run_dir / f"codex-{repair_stamp}.log", run_dir / "codex.log")
         if not repair.success:
-            return False, verify, diff, f"Repair attempt failed with exit code {repair.exit_code}."
+            return False, verify, diff, f"Repair attempt failed with exit code {repair.exit_code}.", "agent"
         verify_log = run_dir / f"verify-{repair_stamp}.log"
         verify = run_verifier(config.verify, worktree_path, verify_log)
         latest_verify.write_text(verify_log.read_text(encoding="utf-8"), encoding="utf-8")
         diff = inspect_diff(worktree_path, config.diff_policy)
 
-    return verify.passed, verify, diff, "" if verify.passed else "Verification failed."
+    return verify.passed, verify, diff, "" if verify.passed else "Verification failed.", "verify"
+
+
+def _run_review_loop(
+    config: WorkerConfig,
+    issue: Issue,
+    repo_root: Path,
+    worktree_path: Path,
+    run_dir: Path,
+    stamp: str,
+    verify: VerifyResult,
+    diff: DiffSummary,
+) -> tuple[bool, VerifyResult, DiffSummary, str, str]:
+    if not config.review.enabled:
+        return True, verify, diff, "", ""
+
+    fixes_completed = 0
+    review_iteration = 0
+    while True:
+        review_iteration += 1
+        review_stamp = f"{stamp}-review-{review_iteration}"
+        review_prompt = build_review_prompt(issue, config, repo_root, diff, verify)
+        review_prompt_path = run_dir / f"prompt-{review_stamp}.md"
+        write_text_artifact(review_prompt_path, run_dir / "prompt.md", review_prompt)
+        before_review = _diff_snapshot(worktree_path)
+        review = _run_codex_session(
+            config,
+            worktree_path,
+            review_prompt_path,
+            run_dir / f"codex-{review_stamp}.log",
+            command=config.review.command,
+        )
+        after_review = _diff_snapshot(worktree_path)
+        review_output = (review.stdout.strip() or review.stderr.strip()).strip()
+        write_text_artifact(run_dir / f"review-{review_stamp}.md", run_dir / "review.md", review_output)
+        if not review.success:
+            return False, verify, diff, f"Review attempt failed with exit code {review.exit_code}.", "agent"
+        if after_review != before_review:
+            return False, verify, diff, "Review attempt modified the worktree; review sessions must be read-only.", "agent"
+        if not review_output:
+            return False, verify, diff, "Review attempt completed without output.", "agent"
+
+        priorities = blocking_review_priorities(review_output, config.review.fix_priorities)
+        if not priorities:
+            return True, verify, diff, "", ""
+
+        if fixes_completed >= config.review.max_iterations:
+            return (
+                False,
+                verify,
+                diff,
+                "Code review still reports blocking findings after "
+                f"{config.review.max_iterations} fix iteration(s): {', '.join(priorities)}.\n\n"
+                f"Latest review output:\n{review_output[-4000:]}",
+                "review",
+            )
+
+        fixes_completed += 1
+        fix_stamp = f"{stamp}-review-fix-{fixes_completed}"
+        fix_prompt = build_review_fix_prompt(issue, review_output, diff, config.review.fix_priorities)
+        fix_prompt_path = run_dir / f"prompt-{fix_stamp}.md"
+        write_text_artifact(fix_prompt_path, run_dir / "prompt.md", fix_prompt)
+        fix = _run_codex_session(
+            config,
+            worktree_path,
+            fix_prompt_path,
+            run_dir / f"codex-{fix_stamp}.log",
+        )
+        if not fix.success:
+            return False, verify, diff, f"Review fix attempt failed with exit code {fix.exit_code}.", "agent"
+
+        ok, verify, diff, error, failure_kind = _run_verification_with_repairs(
+            config,
+            issue,
+            worktree_path,
+            run_dir,
+            fix_stamp,
+        )
+        if not ok:
+            return False, verify, diff, f"Verification failed after review fix.\n\n{error}", failure_kind
+
+
+def _run_agent_and_verify(
+    config: WorkerConfig,
+    issue: Issue,
+    repo_root: Path,
+    worktree_path: Path,
+    run_dir: Path,
+    stamp: str,
+) -> tuple[bool, VerifyResult | None, DiffSummary, str, str]:
+    prompt_text = build_prompt(issue, config, repo_root)
+    prompt_path = run_dir / f"prompt-{stamp}.md"
+    write_text_artifact(prompt_path, run_dir / "prompt.md", prompt_text)
+
+    codex_log = run_dir / f"codex-{stamp}.log"
+    agent = _run_codex_session(config, worktree_path, prompt_path, codex_log)
+    if not agent.success:
+        return False, None, inspect_diff(worktree_path, config.diff_policy), (
+            f"Agent failed with exit code {agent.exit_code}."
+            f"\n\nstdout:\n{agent.stdout[-2000:]}\n\nstderr:\n{agent.stderr[-2000:]}"
+        ), "agent"
+
+    ok, verify, diff, error, failure_kind = _run_verification_with_repairs(config, issue, worktree_path, run_dir, stamp)
+    if not ok:
+        return ok, verify, diff, error, failure_kind
+
+    return _run_review_loop(config, issue, repo_root, worktree_path, run_dir, stamp, verify, diff)
 
 
 def process_issue(config: WorkerConfig, issue: Issue, repo_root: Path, paths: dict[str, Path]) -> int:
@@ -223,14 +373,19 @@ def process_issue(config: WorkerConfig, issue: Issue, repo_root: Path, paths: di
         _write_record(run_dir, record, "failed", str(exc))
         return EXIT_GIT
 
-    ok, verify, diff, error = _run_agent_and_verify(config, issue, repo_root, worktree_path, run_dir, stamp)
+    ok, verify, diff, error, failure_kind = _run_agent_and_verify(config, issue, repo_root, worktree_path, run_dir, stamp)
     record.changed_files = diff.changed_files
     record.verifier_passed = verify.passed if verify else None
     if not ok:
-        status = "agent_failed" if verify is None else "verify_failed"
+        if failure_kind == "agent":
+            status = "agent_failed"
+        elif failure_kind == "review":
+            status = "review_failed"
+        else:
+            status = "verify_failed"
         _finalize_issue_failure(gh, config, issue, run_dir, error, add_failed_label=True)
         _write_record(run_dir, record, status, error)
-        return EXIT_AGENT if verify is None else EXIT_VERIFY
+        return EXIT_AGENT if failure_kind == "agent" else EXIT_VERIFY
 
     if diff.rejected:
         status = "no_changes" if diff.rejection_reason == "no changes" else "diff_rejected"

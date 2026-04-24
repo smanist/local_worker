@@ -11,6 +11,8 @@ def test_default_config_generation_works(tmp_path: Path):
     config = load_config(path)
     assert config.repo == "owner/repo"
     assert config.issue_selection.ready_label == "ai-ready"
+    assert config.agent.model == "gpt-5.4"
+    assert config.agent.reasoning == "high"
 
 
 def test_config_missing_repo_fails_clearly():
@@ -18,9 +20,24 @@ def test_config_missing_repo_fails_clearly():
         config_from_dict({"base_branch": "main"})
 
 
+def test_config_accepts_agent_model_and_reasoning():
+    config = config_from_dict({"repo": "owner/repo", "agent": {"model": "gpt-5.4", "reasoning": "xhigh"}})
+    assert config.agent.model == "gpt-5.4"
+    assert config.agent.reasoning == "xhigh"
+
+
+def test_config_accepts_legacy_reasoning_effort():
+    config = config_from_dict({"repo": "owner/repo", "agent": {"reasoning_effort": "xhigh"}})
+    assert config.agent.reasoning == "xhigh"
+
+
+def test_config_rejects_unknown_reasoning():
+    with pytest.raises(ConfigError, match="reasoning"):
+        config_from_dict({"repo": "owner/repo", "agent": {"reasoning": "max"}})
+
+
 def test_init_refuses_overwrite_without_force(tmp_path: Path):
     path = tmp_path / "config.yaml"
     path.write_text("repo: owner/repo\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="already exists"):
         write_default_config(path)
-

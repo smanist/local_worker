@@ -35,6 +35,22 @@ class DependencyError(RuntimeError):
     pass
 
 
+class RunOverrides:
+    def __init__(self, model: str | None = None, reasoning: str | None = None):
+        self.model = model
+        self.reasoning = reasoning
+
+
+def apply_overrides(config: WorkerConfig, overrides: RunOverrides | None = None) -> WorkerConfig:
+    if overrides is None:
+        return config
+    if overrides.model:
+        config.agent.model = overrides.model
+    if overrides.reasoning:
+        config.agent.reasoning = overrides.reasoning
+    return config
+
+
 def _path(root: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else root / path
@@ -141,7 +157,12 @@ def _run_agent_and_verify(
     write_text_artifact(prompt_path, run_dir / "prompt.md", prompt_text)
 
     codex_log = run_dir / f"codex-{stamp}.log"
-    backend = CodexBackend(config.agent.command, codex_log)
+    backend = CodexBackend(
+        config.agent.command,
+        codex_log,
+        model=config.agent.model,
+        reasoning=config.agent.reasoning,
+    )
     agent = backend.run(worktree_path, prompt_path, timeout_sec=config.agent.timeout_minutes * 60)
     shutil.copyfile(codex_log, run_dir / "codex.log")
     if not agent.success:
@@ -163,7 +184,12 @@ def _run_agent_and_verify(
         repair_prompt = build_repair_prompt(issue, verify_log.read_text(encoding="utf-8"), diff)
         repair_prompt_path = run_dir / f"prompt-{repair_stamp}.md"
         write_text_artifact(repair_prompt_path, run_dir / "prompt.md", repair_prompt)
-        backend = CodexBackend(config.agent.command, run_dir / f"codex-{repair_stamp}.log")
+        backend = CodexBackend(
+            config.agent.command,
+            run_dir / f"codex-{repair_stamp}.log",
+            model=config.agent.model,
+            reasoning=config.agent.reasoning,
+        )
         repair = backend.run(worktree_path, repair_prompt_path, timeout_sec=config.agent.timeout_minutes * 60)
         shutil.copyfile(run_dir / f"codex-{repair_stamp}.log", run_dir / "codex.log")
         if not repair.success:
@@ -259,10 +285,10 @@ def process_issue(config: WorkerConfig, issue: Issue, repo_root: Path, paths: di
     return EXIT_OK
 
 
-def run_once(config_path: Path, repo_root: Path | None = None) -> int:
+def run_once(config_path: Path, repo_root: Path | None = None, overrides: RunOverrides | None = None) -> int:
     root = repo_root or Path.cwd()
     try:
-        config = load_config(config_path)
+        config = apply_overrides(load_config(config_path), overrides)
     except ConfigError as exc:
         print(f"configuration error: {exc}")
         return EXIT_CONFIG

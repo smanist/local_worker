@@ -8,6 +8,7 @@ import yaml
 
 
 DEFAULT_CONFIG_PATH = ".ai-issue-worker.yaml"
+REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 
 
 class ConfigError(ValueError):
@@ -52,6 +53,8 @@ class GitConfig:
 class AgentConfig:
     backend: str = "codex"
     command: str = "codex exec --full-auto"
+    model: str | None = "gpt-5.4"
+    reasoning: str | None = "high"
     timeout_minutes: int = 30
     max_repair_attempts: int = 1
 
@@ -131,8 +134,14 @@ def default_config_dict(repo: str = "owner/repo") -> dict[str, Any]:
 def config_from_dict(data: dict[str, Any]) -> WorkerConfig:
     if not data.get("repo"):
         raise ConfigError("config field 'repo' is required")
+    data = dict(data)
+    if isinstance(data.get("agent"), dict):
+        agent = dict(data["agent"])
+        if "reasoning_effort" in agent:
+            agent.setdefault("reasoning", agent.pop("reasoning_effort"))
+        data["agent"] = agent
     raw = _merge(default_config_dict(repo=data["repo"]), data)
-    return WorkerConfig(
+    config = WorkerConfig(
         repo=raw["repo"],
         base_branch=raw.get("base_branch", "main"),
         paths=PathsConfig(**raw["paths"]),
@@ -144,6 +153,10 @@ def config_from_dict(data: dict[str, Any]) -> WorkerConfig:
         diff_policy=DiffPolicyConfig(**raw["diff_policy"]),
         pr=PRConfig(**raw["pr"]),
     )
+    if config.agent.reasoning and config.agent.reasoning not in REASONING_EFFORTS:
+        allowed = ", ".join(REASONING_EFFORTS)
+        raise ConfigError(f"agent.reasoning must be one of: {allowed}")
+    return config
 
 
 def load_config(path: Path) -> WorkerConfig:

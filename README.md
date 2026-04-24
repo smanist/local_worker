@@ -40,6 +40,21 @@ Run one local cycle:
 ai-issue run-once
 ```
 
+Pick a Codex model and reasoning effort for a single run:
+
+```bash
+ai-issue run-once --model gpt-5.4 --reasoning high
+```
+
+For persistent defaults, set these in `.ai-issue-worker.yaml`:
+
+```yaml
+agent:
+  command: codex exec --full-auto
+  model: gpt-5.4
+  reasoning: high
+```
+
 Start a simple background loop:
 
 ```bash

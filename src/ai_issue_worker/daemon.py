@@ -7,9 +7,9 @@ import signal
 import time
 from pathlib import Path
 
-from .config import DEFAULT_CONFIG_PATH, load_config
+from .config import DEFAULT_CONFIG_PATH, REASONING_EFFORTS, load_config
 from .jobs import utc_iso
-from .runner import configured_paths, run_once
+from .runner import RunOverrides, configured_paths, run_once
 
 
 STOP = False
@@ -46,7 +46,12 @@ def write_status(path: Path, **values) -> None:
     path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def daemon_loop(config_path: Path, interval_minutes: int | None = None) -> int:
+def daemon_loop(
+    config_path: Path,
+    interval_minutes: int | None = None,
+    model: str | None = None,
+    reasoning: str | None = None,
+) -> int:
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
     config = load_config(config_path)
@@ -72,7 +77,11 @@ def daemon_loop(config_path: Path, interval_minutes: int | None = None) -> int:
     )
     try:
         while not STOP:
-            exit_code = run_once(config_path, repo_root=root)
+            exit_code = run_once(
+                config_path,
+                repo_root=root,
+                overrides=RunOverrides(model=model, reasoning=reasoning),
+            )
             write_status(
                 status_file,
                 running=True,
@@ -96,8 +105,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--interval", type=int)
+    parser.add_argument("--model")
+    parser.add_argument("--reasoning", choices=REASONING_EFFORTS)
     args = parser.parse_args(argv)
-    return daemon_loop(Path(args.config), args.interval)
+    return daemon_loop(Path(args.config), args.interval, model=args.model, reasoning=args.reasoning)
 
 
 if __name__ == "__main__":

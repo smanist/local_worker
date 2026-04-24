@@ -11,13 +11,13 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .config import DEFAULT_CONFIG_PATH, ConfigError, load_config, write_default_config
+from .config import DEFAULT_CONFIG_PATH, REASONING_EFFORTS, ConfigError, load_config, write_default_config
 from .daemon import pid_alive, read_json, write_status
 from .github_gh import GHClient, GHError
 from .issue_selection import candidate_issues
 from .jobs import issue_run_dir, recent_jobs
 from .locking import lock_status
-from .runner import configured_paths, run_once
+from .runner import RunOverrides, configured_paths, run_once
 from .shell import run_cmd
 from .worktree import GitError, remove_worktree
 
@@ -85,7 +85,7 @@ def cmd_list(args) -> int:
 
 
 def cmd_run_once(args) -> int:
-    return run_once(Path(args.config))
+    return run_once(Path(args.config), overrides=RunOverrides(model=args.model, reasoning=args.reasoning))
 
 
 def cmd_inspect(args) -> int:
@@ -151,9 +151,13 @@ def cmd_start(args) -> int:
     if args.foreground:
         from .daemon import daemon_loop
 
-        return daemon_loop(Path(args.config), interval)
+        return daemon_loop(Path(args.config), interval, model=args.model, reasoning=args.reasoning)
     log_handle = log_file.open("a", encoding="utf-8")
     command = [sys.executable, "-m", "ai_issue_worker.daemon", "--config", str(Path(args.config).resolve()), "--interval", str(interval)]
+    if args.model:
+        command.extend(["--model", args.model])
+    if args.reasoning:
+        command.extend(["--reasoning", args.reasoning])
     proc = subprocess.Popen(command, cwd=Path.cwd(), stdout=log_handle, stderr=subprocess.STDOUT, start_new_session=True)
     pid_file.write_text(str(proc.pid), encoding="utf-8")
     write_status(status_file, running=True, pid=proc.pid, started_at=None, last_status="starting", log_file=str(log_file))
@@ -262,7 +266,7 @@ def cmd_retry(args) -> int:
         print(exc, file=sys.stderr)
         return 1
     if args.run_now:
-        return run_once(Path(args.config))
+        return run_once(Path(args.config), overrides=RunOverrides(model=args.model, reasoning=args.reasoning))
     print(f"issue #{args.issue} marked ready")
     return 0
 
@@ -310,6 +314,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run-once")
     run.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+    run.add_argument("--model")
+    run.add_argument("--reasoning", choices=REASONING_EFFORTS)
     run.set_defaults(func=cmd_run_once)
 
     list_cmd = sub.add_parser("list")
@@ -326,6 +332,8 @@ def build_parser() -> argparse.ArgumentParser:
     start = sub.add_parser("start")
     start.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     start.add_argument("--interval", dest="interval_minutes", type=parse_interval_minutes)
+    start.add_argument("--model")
+    start.add_argument("--reasoning", choices=REASONING_EFFORTS)
     start.add_argument("--foreground", action="store_true")
     start.set_defaults(func=cmd_start)
 
@@ -348,6 +356,8 @@ def build_parser() -> argparse.ArgumentParser:
     retry.add_argument("issue", type=int)
     retry.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     retry.add_argument("--run-now", action="store_true")
+    retry.add_argument("--model")
+    retry.add_argument("--reasoning", choices=REASONING_EFFORTS)
     retry.set_defaults(func=cmd_retry)
 
     clean = sub.add_parser("clean")

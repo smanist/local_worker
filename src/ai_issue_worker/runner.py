@@ -49,7 +49,14 @@ def configured_paths(config: WorkerConfig, root: Path) -> dict[str, Path]:
     }
 
 
-def check_dependencies(config: WorkerConfig) -> None:
+def _relative_prefix(root: Path, path: Path) -> str | None:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except ValueError:
+        return None
+
+
+def check_dependencies(config: WorkerConfig, root: Path | None = None, paths: dict[str, Path] | None = None) -> None:
     checks = [
         ["gh", "--version"],
         ["git", "--version"],
@@ -60,7 +67,13 @@ def check_dependencies(config: WorkerConfig) -> None:
         if result.exit_code != 0:
             raise DependencyError(result.stderr.strip() or f"dependency check failed: {result.command}")
     GHClient(config.repo).validate()
-    ensure_git_ok(config.base_branch, allow_dirty=config.git.allow_dirty_base)
+    allowed_prefixes: list[str] = []
+    if root and paths:
+        for key in ("worktree_root", "run_root", "log_root", "runtime_root"):
+            prefix = _relative_prefix(root, paths[key])
+            if prefix:
+                allowed_prefixes.append(prefix)
+    ensure_git_ok(config.base_branch, allow_dirty=config.git.allow_dirty_base, allowed_dirty_prefixes=allowed_prefixes)
 
 
 def _comment_failure(gh: GHClient, issue: Issue, run_dir: Path, message: str) -> None:
@@ -260,7 +273,7 @@ def run_once(config_path: Path, repo_root: Path | None = None) -> int:
     try:
         with FileLock(paths["runtime_root"] / "worker.lock"):
             try:
-                check_dependencies(config)
+                check_dependencies(config, root=root, paths=paths)
             except DependencyError as exc:
                 print(f"dependency error: {exc}")
                 return EXIT_DEPENDENCY

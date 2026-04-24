@@ -31,7 +31,23 @@ def branch_name(prefix: str, issue_number: int, title: str, max_length: int = 80
     return branch
 
 
-def ensure_git_ok(base_branch: str, allow_dirty: bool = False) -> None:
+def _status_path(line: str) -> str:
+    path = line[3:].strip()
+    if " -> " in path:
+        path = path.split(" -> ", 1)[1]
+    return path.strip('"')
+
+
+def _is_allowed_dirty(path: str, allowed_prefixes: list[str]) -> bool:
+    normalized = path.rstrip("/")
+    for prefix in allowed_prefixes:
+        clean = prefix.strip("/").rstrip("/")
+        if clean and (normalized == clean or normalized.startswith(f"{clean}/")):
+            return True
+    return False
+
+
+def ensure_git_ok(base_branch: str, allow_dirty: bool = False, allowed_dirty_prefixes: list[str] | None = None) -> None:
     top = run_cmd(["git", "rev-parse", "--show-toplevel"])
     if top.exit_code != 0:
         raise GitError(top.stderr.strip() or "not inside a git repository")
@@ -41,8 +57,11 @@ def ensure_git_ok(base_branch: str, allow_dirty: bool = False) -> None:
     status = run_cmd(["git", "status", "--porcelain"])
     if status.exit_code != 0:
         raise GitError(status.stderr.strip() or "git status failed")
-    if status.stdout.strip() and not allow_dirty:
-        raise GitError("base checkout has uncommitted changes")
+    allowed = allowed_dirty_prefixes or []
+    dirty = [line for line in status.stdout.splitlines() if not _is_allowed_dirty(_status_path(line), allowed)]
+    if dirty and not allow_dirty:
+        details = "\n".join(dirty[:20])
+        raise GitError(f"base checkout has uncommitted changes:\n{details}")
     fetch = run_cmd(["git", "fetch", "origin", base_branch])
     if fetch.exit_code != 0:
         raise GitError(fetch.stderr.strip() or "git fetch failed")

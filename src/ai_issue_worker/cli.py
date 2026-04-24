@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -58,6 +60,74 @@ def _paths(config, root: Path):
     return paths
 
 
+def _first_nonempty_line(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip().lstrip("#").strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _derive_issue_title(description: str, title: str | None) -> str:
+    if title:
+        return title.strip()
+    first = _first_nonempty_line(description)
+    if not first:
+        return ""
+    first = first.removeprefix("- ").removeprefix("* ").strip()
+    return first[:120].rstrip(" .")
+
+
+def _issue_markdown(description: str) -> str:
+    description = description.strip()
+    return f"""## Summary
+
+{description}
+
+## Expected outcome
+
+- 
+
+## Acceptance criteria
+
+- [ ] 
+
+## Notes for the AI worker
+
+- Keep the change focused on this issue.
+- Add or update tests when appropriate.
+"""
+
+
+def _read_description(args) -> str:
+    if args.description_file:
+        if args.description_file == "-":
+            return sys.stdin.read()
+        return Path(args.description_file).read_text(encoding="utf-8")
+    if args.description:
+        return " ".join(args.description)
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    return ""
+
+
+def _editor_command(editor: str | None = None) -> list[str]:
+    for command in [editor, os.environ.get("VISUAL"), os.environ.get("EDITOR")]:
+        if command:
+            return shlex.split(command)
+    for name in ["nano", "vi"]:
+        path = shutil.which(name)
+        if path:
+            return [path]
+    raise RuntimeError("no editor found; set EDITOR or pass --no-edit")
+
+
+def _run_editor(path: Path, editor: str | None = None) -> None:
+    result = subprocess.run([*_editor_command(editor), str(path)], check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"editor exited with status {result.returncode}")
+
+
 def cmd_init(args) -> int:
     try:
         write_default_config(Path(args.path), force=args.force)
@@ -81,6 +151,36 @@ def cmd_list(args) -> int:
         return 0
     for issue in candidates:
         print(f"#{issue.number}\t{issue.state}\t{issue.updated_at or ''}\t{','.join(issue.labels)}\t{issue.title}")
+    return 0
+
+
+def cmd_create(args) -> int:
+    try:
+        config = _load(args.config)
+        description = _read_description(args).strip()
+        if not description:
+            raise ConfigError("issue description is required; pass text, --description-file, or pipe stdin")
+        title = _derive_issue_title(description, args.title)
+        if not title:
+            raise ConfigError("issue title is required; pass --title or start the description with a title line")
+        body = _issue_markdown(description)
+        draft_dir = Path(tempfile.mkdtemp(prefix="ai-issue-create-"))
+        body_file = draft_dir / "issue.md"
+        try:
+            body_file.write_text(body, encoding="utf-8")
+            if not args.no_edit:
+                _run_editor(body_file, args.editor)
+            edited_body = body_file.read_text(encoding="utf-8").strip()
+            if not edited_body:
+                raise ConfigError("issue body is empty after editing; aborting")
+            body_file.write_text(f"{edited_body}\n", encoding="utf-8")
+            url = GHClient(config.repo).create_issue(title, body_file, labels=[config.issue_selection.ready_label])
+        finally:
+            shutil.rmtree(draft_dir, ignore_errors=True)
+    except (ConfigError, GHError, RuntimeError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    print(f"created issue: {url}")
     return 0
 
 
@@ -322,6 +422,15 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     list_cmd.add_argument("--json", action="store_true")
     list_cmd.set_defaults(func=cmd_list)
+
+    create = sub.add_parser("create")
+    create.add_argument("description", nargs="*")
+    create.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+    create.add_argument("--title")
+    create.add_argument("--description-file")
+    create.add_argument("--editor")
+    create.add_argument("--no-edit", action="store_true")
+    create.set_defaults(func=cmd_create)
 
     inspect = sub.add_parser("inspect")
     inspect.add_argument("--config", default=DEFAULT_CONFIG_PATH)

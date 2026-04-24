@@ -67,6 +67,23 @@ class GHClient:
     def comment(self, number: int, body_file: Path) -> None:
         self._run(["gh", "issue", "comment", str(number), "--repo", self.repo, "--body-file", str(body_file)])
 
+    def create_issue(self, title: str, body_file: Path, labels: list[str] | None = None) -> str:
+        args = [
+            "gh",
+            "issue",
+            "create",
+            "--repo",
+            self.repo,
+            "--title",
+            title,
+            "--body-file",
+            str(body_file),
+        ]
+        for label in labels or []:
+            args.extend(["--label", label])
+        result = self._run(args)
+        return result.stdout.strip().splitlines()[-1]
+
     def create_pr(
         self,
         base: str,
@@ -94,4 +111,3 @@ class GHClient:
             args.append("--draft")
         result = self._run(args)
         return result.stdout.strip().splitlines()[-1]
-

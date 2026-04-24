@@ -34,6 +34,17 @@ List candidate issues:
 ai-issue list
 ```
 
+Create a new AI-ready issue from a local description. The command drafts a
+Markdown issue body, opens it in your editor, then creates the GitHub issue with
+the configured ready label:
+
+```bash
+ai-issue create --title "Fix parser crash" "Parser crashes when input is empty."
+```
+
+Use `--description-file path/to/issue.txt` for longer descriptions, or
+`--no-edit` for non-interactive scripts.
+
 Run one local cycle:
 
 ```bash

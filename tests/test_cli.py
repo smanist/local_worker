@@ -53,3 +53,61 @@ def test_run_once_passes_model_and_reasoning_overrides(tmp_path: Path, monkeypat
     assert captured["config_path"] == Path(".ai-issue-worker.yaml")
     assert captured["model"] == "gpt-5.4"
     assert captured["reasoning"] == "xhigh"
+
+
+def test_cli_create_issue_uses_ready_label_and_generated_body(tmp_path: Path, monkeypatch, capsys):
+    path = tmp_path / "config.yaml"
+    path.write_text("repo: owner/repo\n", encoding="utf-8")
+    captured = {}
+
+    class FakeCreateGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def create_issue(self, title: str, body_file: Path, labels: list[str]):
+            captured["repo"] = self.repo
+            captured["title"] = title
+            captured["body"] = body_file.read_text(encoding="utf-8")
+            captured["labels"] = labels
+            return "https://github.com/owner/repo/issues/123"
+
+    monkeypatch.setattr(cli, "GHClient", FakeCreateGH)
+    result = cli.main(["create", "--config", str(path), "--title", "Broken parser", "--no-edit", "Parser fails on empty input"])
+
+    assert result == 0
+    assert captured["repo"] == "owner/repo"
+    assert captured["title"] == "Broken parser"
+    assert captured["labels"] == ["ai-ready"]
+    assert "## Summary" in captured["body"]
+    assert "Parser fails on empty input" in captured["body"]
+    assert "created issue: https://github.com/owner/repo/issues/123" in capsys.readouterr().out
+
+
+def test_cli_create_issue_derives_title_and_runs_editor(tmp_path: Path, monkeypatch):
+    path = tmp_path / "config.yaml"
+    path.write_text("repo: owner/repo\n", encoding="utf-8")
+    captured = {}
+
+    class FakeCreateGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def create_issue(self, title: str, body_file: Path, labels: list[str]):
+            captured["title"] = title
+            captured["body"] = body_file.read_text(encoding="utf-8")
+            captured["labels"] = labels
+            return "https://github.com/owner/repo/issues/124"
+
+    def fake_editor(body_file: Path, editor: str | None = None):
+        existing = body_file.read_text(encoding="utf-8")
+        body_file.write_text(f"{existing}\nEdited in editor.\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "GHClient", FakeCreateGH)
+    monkeypatch.setattr(cli, "_run_editor", fake_editor)
+
+    result = cli.main(["create", "--config", str(path), "Fix parser crash", "when input is empty"])
+
+    assert result == 0
+    assert captured["title"] == "Fix parser crash when input is empty"
+    assert captured["labels"] == ["ai-ready"]
+    assert "Edited in editor." in captured["body"]

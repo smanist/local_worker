@@ -117,6 +117,12 @@ ipython_config.py
 .pdm-python
 .pdm-build/
 
+# Local AI Issue Worker runtime
+.ai-worktrees/
+.ai-runs/
+.ai-logs/
+.ai-runtime/
+
 # pixi
 #   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
 #pixi.lock

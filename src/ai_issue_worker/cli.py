@@ -206,7 +206,13 @@ def cmd_list(args) -> int:
         config = _load(args.config)
         gh = GHClient(config.repo)
         issues = gh.list_issues(config.issue_selection.ready_label)
-        candidates = workable_issues(gh, issues, config.issue_selection)
+        candidates = workable_issues(
+            gh,
+            issues,
+            config.issue_selection,
+            config.base_branch,
+            _paths(config, Path.cwd()),
+        )
     except (ConfigError, GHError) as exc:
         print(exc, file=sys.stderr)
         return 1

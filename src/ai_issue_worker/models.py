@@ -37,6 +37,9 @@ class JobRecord:
     worktree_path: str
     status: str
     started_at: str
+    base_branch: str | None = None
+    stack_depth: int = 0
+    blocker_issue_numbers: list[int] = field(default_factory=list)
     finished_at: str | None = None
     pr_url: str | None = None
     error_summary: str | None = None
@@ -83,4 +86,3 @@ class DiffSummary:
     diff_line_count: int
     rejected: bool
     rejection_reason: str | None
-

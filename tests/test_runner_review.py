@@ -2,8 +2,9 @@ import subprocess
 from pathlib import Path
 
 from ai_issue_worker.config import config_from_dict
-from ai_issue_worker.models import AgentResult, CommandResult, DiffSummary, Issue, VerifyResult
-from ai_issue_worker.runner import _diff_snapshot, _run_agent_and_verify, blocking_review_priorities, select_workable_issue
+from ai_issue_worker.jobs import write_job_record
+from ai_issue_worker.models import AgentResult, CommandResult, DiffSummary, Issue, JobRecord, VerifyResult
+from ai_issue_worker.runner import _diff_snapshot, _run_agent_and_verify, blocking_review_priorities, select_work_plan
 
 
 def _issue() -> Issue:
@@ -38,39 +39,118 @@ def test_blocking_review_priorities_fallback_ignores_plain_no_p0_p1_text():
 
 def test_select_workable_issue_skips_candidates_with_open_blockers():
     config = config_from_dict({"repo": "owner/repo"}).issue_selection
+    paths = {"run_root": Path("/missing")}
     issues = [
         Issue(1, "Blocked", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z"),
         Issue(2, "Ready", "", ["ai-ready"], "open", updated_at="2026-01-02T00:00:00Z"),
     ]
     gh = FakeDependencyGH({1: [Issue(10, "Blocker", "", [], "open")]})
 
-    issue = select_workable_issue(gh, issues, config)
+    plan = select_work_plan(gh, issues, config, "main", paths)
 
-    assert issue and issue.number == 2
+    assert plan and plan.issue.number == 2
+    assert plan.base_branch == "main"
     assert gh.checked == [1, 2]
 
 
 def test_select_workable_issue_allows_candidates_with_closed_blockers():
     config = config_from_dict({"repo": "owner/repo"}).issue_selection
+    paths = {"run_root": Path("/missing")}
     issues = [Issue(1, "Unblocked", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
     gh = FakeDependencyGH({1: [Issue(10, "Done blocker", "", [], "closed")]})
 
-    issue = select_workable_issue(gh, issues, config)
+    plan = select_work_plan(gh, issues, config, "main", paths)
 
-    assert issue and issue.number == 1
+    assert plan and plan.issue.number == 1
+    assert plan.base_branch == "main"
 
 
 def test_select_workable_issue_can_ignore_dependency_checks():
     config = config_from_dict(
         {"repo": "owner/repo", "issue_selection": {"respect_issue_dependencies": False}}
     ).issue_selection
+    paths = {"run_root": Path("/missing")}
     issues = [Issue(1, "Blocked but selected", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
     gh = FakeDependencyGH({1: [Issue(10, "Blocker", "", [], "open")]})
 
-    issue = select_workable_issue(gh, issues, config)
+    plan = select_work_plan(gh, issues, config, "main", paths)
 
-    assert issue and issue.number == 1
+    assert plan and plan.issue.number == 1
+    assert plan.base_branch == "main"
     assert gh.checked == []
+
+
+def _write_pr_job(run_root: Path, issue_number: int, branch_name: str, stack_depth: int = 0) -> None:
+    write_job_record(
+        run_root / f"issue-{issue_number}",
+        JobRecord(
+            issue_number=issue_number,
+            issue_title=f"Issue {issue_number}",
+            branch_name=branch_name,
+            worktree_path=f"/tmp/issue-{issue_number}",
+            status="pr_opened",
+            started_at="2026-01-01T00:00:00Z",
+            base_branch="main",
+            stack_depth=stack_depth,
+            pr_url=f"https://github.com/owner/repo/pull/{issue_number}",
+        ),
+        timestamp="20260101-000000",
+    )
+
+
+def test_select_workable_issue_stacks_on_blocker_pr_branch(tmp_path: Path):
+    config = config_from_dict(
+        {"repo": "owner/repo", "issue_selection": {"allow_stacked_prs": True, "max_stack_depth": 3}}
+    ).issue_selection
+    paths = {"run_root": tmp_path}
+    _write_pr_job(tmp_path, 10, "ai/issue-10-base", stack_depth=0)
+    issues = [Issue(11, "Downstream", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
+    gh = FakeDependencyGH({11: [Issue(10, "Blocker", "", [], "open")]})
+
+    plan = select_work_plan(gh, issues, config, "main", paths)
+
+    assert plan and plan.issue.number == 11
+    assert plan.base_branch == "ai/issue-10-base"
+    assert plan.stack_depth == 1
+    assert plan.blocker_issue_numbers == [10]
+
+
+def test_select_workable_issue_skips_stacking_without_blocker_pr(tmp_path: Path):
+    config = config_from_dict({"repo": "owner/repo", "issue_selection": {"allow_stacked_prs": True}}).issue_selection
+    paths = {"run_root": tmp_path}
+    issues = [Issue(11, "Downstream", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
+    gh = FakeDependencyGH({11: [Issue(10, "Blocker", "", [], "open")]})
+
+    plan = select_work_plan(gh, issues, config, "main", paths)
+
+    assert plan is None
+
+
+def test_select_workable_issue_skips_multiple_open_blockers(tmp_path: Path):
+    config = config_from_dict({"repo": "owner/repo", "issue_selection": {"allow_stacked_prs": True}}).issue_selection
+    paths = {"run_root": tmp_path}
+    _write_pr_job(tmp_path, 10, "ai/issue-10-a")
+    _write_pr_job(tmp_path, 20, "ai/issue-20-b")
+    issues = [Issue(30, "Downstream", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
+    gh = FakeDependencyGH({30: [Issue(10, "Blocker A", "", [], "open"), Issue(20, "Blocker B", "", [], "open")]})
+
+    plan = select_work_plan(gh, issues, config, "main", paths)
+
+    assert plan is None
+
+
+def test_select_workable_issue_respects_max_stack_depth(tmp_path: Path):
+    config = config_from_dict(
+        {"repo": "owner/repo", "issue_selection": {"allow_stacked_prs": True, "max_stack_depth": 1}}
+    ).issue_selection
+    paths = {"run_root": tmp_path}
+    _write_pr_job(tmp_path, 10, "ai/issue-10-base", stack_depth=1)
+    issues = [Issue(11, "Downstream", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
+    gh = FakeDependencyGH({11: [Issue(10, "Blocker", "", [], "open")]})
+
+    plan = select_work_plan(gh, issues, config, "main", paths)
+
+    assert plan is None
 
 
 def test_run_agent_review_fix_loop_until_clean(monkeypatch, tmp_path: Path):

@@ -4,14 +4,15 @@ import hashlib
 import re
 import shlex
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 from .codex_backend import CodexBackend
 from .config import ConfigError, IssueSelectionConfig, WorkerConfig, load_config
 from .diff_policy import inspect_diff
 from .github_gh import GHClient, GHError
-from .issue_selection import candidate_issues, select_one_issue
-from .jobs import issue_run_dir, utc_iso, utc_timestamp, write_job_record, write_text_artifact
+from .issue_selection import candidate_issues
+from .jobs import issue_run_dir, load_job_record, utc_iso, utc_timestamp, write_job_record, write_text_artifact
 from .locking import FileLock, LockHeld
 from .models import DiffSummary, Issue, JobRecord, VerifyResult
 from .pr import build_pr_body, render_template
@@ -43,6 +44,14 @@ class RunOverrides:
     def __init__(self, model: str | None = None, reasoning: str | None = None):
         self.model = model
         self.reasoning = reasoning
+
+
+@dataclass(frozen=True)
+class IssueWorkPlan:
+    issue: Issue
+    base_branch: str
+    stack_depth: int = 0
+    blocker_issue_numbers: list[int] | None = None
 
 
 def apply_overrides(config: WorkerConfig, overrides: RunOverrides | None = None) -> WorkerConfig:
@@ -134,7 +143,7 @@ def _write_record(run_dir: Path, record: JobRecord, status: str, error: str | No
     write_job_record(run_dir, record)
 
 
-def _record_for(issue: Issue, branch: str, worktree_path: Path) -> JobRecord:
+def _record_for(issue: Issue, branch: str, worktree_path: Path, plan: IssueWorkPlan) -> JobRecord:
     return JobRecord(
         issue_number=issue.number,
         issue_title=issue.title,
@@ -142,6 +151,9 @@ def _record_for(issue: Issue, branch: str, worktree_path: Path) -> JobRecord:
         worktree_path=str(worktree_path),
         status="selected",
         started_at=utc_iso(),
+        base_branch=plan.base_branch,
+        stack_depth=plan.stack_depth,
+        blocker_issue_numbers=list(plan.blocker_issue_numbers or []),
         finished_at=None,
         pr_url=None,
         error_summary=None,
@@ -150,25 +162,84 @@ def _record_for(issue: Issue, branch: str, worktree_path: Path) -> JobRecord:
     )
 
 
-def _has_open_blockers(gh: GHClient, issue: Issue) -> bool:
-    return any(blocker.state.lower() == "open" for blocker in gh.blocked_by(issue.number))
+def _open_blockers(gh: GHClient, issue: Issue) -> list[Issue]:
+    return [blocker for blocker in gh.blocked_by(issue.number) if blocker.state.lower() == "open"]
 
 
-def workable_issues(gh: GHClient, issues: list[Issue], config: IssueSelectionConfig) -> list[Issue]:
-    candidates = candidate_issues(issues, config)
+def _latest_pr_job(paths: dict[str, Path], issue_number: int) -> JobRecord | None:
+    latest = issue_run_dir(paths["run_root"], issue_number) / "latest.json"
+    if not latest.exists():
+        return None
+    try:
+        record = load_job_record(latest)
+    except (OSError, ValueError, TypeError):
+        return None
+    if record.status != "pr_opened" or not record.pr_url:
+        return None
+    return record
+
+
+def _work_plan_for_issue(
+    gh: GHClient,
+    issue: Issue,
+    config: IssueSelectionConfig,
+    base_branch: str,
+    paths: dict[str, Path],
+) -> IssueWorkPlan | None:
     if not config.respect_issue_dependencies:
-        return candidates
-    return [issue for issue in candidates if not _has_open_blockers(gh, issue)]
+        return IssueWorkPlan(issue, base_branch)
+
+    blockers = _open_blockers(gh, issue)
+    if not blockers:
+        return IssueWorkPlan(issue, base_branch)
+    if not config.allow_stacked_prs or len(blockers) != 1:
+        return None
+
+    blocker = blockers[0]
+    blocker_job = _latest_pr_job(paths, blocker.number)
+    if blocker_job is None:
+        return None
+    stack_depth = blocker_job.stack_depth + 1
+    if stack_depth > config.max_stack_depth:
+        return None
+    return IssueWorkPlan(issue, blocker_job.branch_name, stack_depth, [blocker.number])
 
 
-def select_workable_issue(gh: GHClient, issues: list[Issue], config: IssueSelectionConfig) -> Issue | None:
+def workable_issue_plans(
+    gh: GHClient,
+    issues: list[Issue],
+    config: IssueSelectionConfig,
+    base_branch: str,
+    paths: dict[str, Path],
+) -> list[IssueWorkPlan]:
     candidates = candidate_issues(issues, config)
-    if not config.respect_issue_dependencies:
-        return select_one_issue(candidates, config)
+    plans: list[IssueWorkPlan] = []
     for issue in candidates:
-        if not _has_open_blockers(gh, issue):
-            return issue
-    return None
+        plan = _work_plan_for_issue(gh, issue, config, base_branch, paths)
+        if plan is not None:
+            plans.append(plan)
+    return plans
+
+
+def workable_issues(
+    gh: GHClient,
+    issues: list[Issue],
+    config: IssueSelectionConfig,
+    base_branch: str,
+    paths: dict[str, Path],
+) -> list[Issue]:
+    return [plan.issue for plan in workable_issue_plans(gh, issues, config, base_branch, paths)]
+
+
+def select_work_plan(
+    gh: GHClient,
+    issues: list[Issue],
+    config: IssueSelectionConfig,
+    base_branch: str,
+    paths: dict[str, Path],
+) -> IssueWorkPlan | None:
+    plans = workable_issue_plans(gh, issues, config, base_branch, paths)
+    return plans[0] if plans else None
 
 
 def blocking_review_priorities(review_output: str, blocking_priorities: list[str]) -> list[str]:
@@ -373,14 +444,15 @@ def _run_agent_and_verify(
     return _run_review_loop(config, issue, repo_root, worktree_path, run_dir, stamp, verify, diff)
 
 
-def process_issue(config: WorkerConfig, issue: Issue, repo_root: Path, paths: dict[str, Path]) -> int:
+def process_issue(config: WorkerConfig, plan: IssueWorkPlan, repo_root: Path, paths: dict[str, Path]) -> int:
+    issue = plan.issue
     gh = GHClient(config.repo)
     stamp = utc_timestamp()
     branch = unique_branch_name(config.git, issue.number, issue.title)
     worktree_path = paths["worktree_root"] / f"issue-{issue.number}"
     run_dir = issue_run_dir(paths["run_root"], issue.number)
     run_dir.mkdir(parents=True, exist_ok=True)
-    record = _record_for(issue, branch, worktree_path)
+    record = _record_for(issue, branch, worktree_path, plan)
     write_job_record(run_dir, record, stamp)
 
     gh.add_label(issue.number, config.issue_selection.working_label)
@@ -388,7 +460,7 @@ def process_issue(config: WorkerConfig, issue: Issue, repo_root: Path, paths: di
     write_job_record(run_dir, record, stamp)
 
     try:
-        add_worktree(worktree_path, branch, config.base_branch)
+        add_worktree(worktree_path, branch, plan.base_branch)
     except GitError as exc:
         _finalize_issue_failure(gh, config, issue, run_dir, f"Git worktree setup failed:\n\n{exc}", add_failed_label=False)
         _write_record(run_dir, record, "failed", str(exc))
@@ -434,7 +506,7 @@ def process_issue(config: WorkerConfig, issue: Issue, repo_root: Path, paths: di
     write_text_artifact(pr_body_path, run_dir / "pr_body.md", pr_body)
     try:
         pr_title = render_template(config.pr.title_template, issue)
-        pr_url = gh.create_pr(config.base_branch, branch, pr_title, pr_body_path, draft=config.pr.draft)
+        pr_url = gh.create_pr(plan.base_branch, branch, pr_title, pr_body_path, draft=config.pr.draft)
     except GHError as exc:
         _finalize_issue_failure(gh, config, issue, run_dir, f"PR creation failed:\n\n{exc}", add_failed_label=False)
         _write_record(run_dir, record, "failed", str(exc))
@@ -489,11 +561,17 @@ def run_once(config_path: Path, repo_root: Path | None = None, overrides: RunOve
             gh = GHClient(config.repo)
             try:
                 issues = gh.list_issues(config.issue_selection.ready_label)
-                issue = select_workable_issue(gh, issues, config.issue_selection)
-                if issue is None:
+                plan = select_work_plan(gh, issues, config.issue_selection, config.base_branch, paths)
+                if plan is None:
                     return EXIT_OK
-                issue = gh.view_issue(issue.number)
-                return process_issue(config, issue, root, paths)
+                issue = gh.view_issue(plan.issue.number)
+                plan = IssueWorkPlan(
+                    issue=issue,
+                    base_branch=plan.base_branch,
+                    stack_depth=plan.stack_depth,
+                    blocker_issue_numbers=plan.blocker_issue_numbers,
+                )
+                return process_issue(config, plan, root, paths)
             except GHError as exc:
                 print(f"GitHub error: {exc}")
                 return EXIT_GH

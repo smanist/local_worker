@@ -83,6 +83,9 @@ def unique_branch_name(config: GitConfig, issue_number: int, title: str) -> str:
 
 def add_worktree(path: Path, branch: str, base_branch: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    fetch = run_cmd(["git", "fetch", "origin", base_branch])
+    if fetch.exit_code != 0:
+        raise GitError(fetch.stderr.strip() or "git fetch failed")
     result = run_cmd(["git", "worktree", "add", "-b", branch, str(path), f"origin/{base_branch}"])
     if result.exit_code != 0:
         raise GitError(result.stderr.strip() or "git worktree add failed")

@@ -12,6 +12,8 @@ def test_default_config_generation_works(tmp_path: Path):
     assert config.repo == "owner/repo"
     assert config.issue_selection.ready_label == "ai-ready"
     assert config.issue_selection.respect_issue_dependencies is True
+    assert config.issue_selection.allow_stacked_prs is False
+    assert config.issue_selection.max_stack_depth == 3
     assert config.agent.model == "gpt-5.4"
     assert config.agent.reasoning == "high"
     assert config.review.enabled is True
@@ -54,6 +56,26 @@ def test_config_accepts_disabling_issue_dependency_selection():
     config = config_from_dict({"repo": "owner/repo", "issue_selection": {"respect_issue_dependencies": False}})
 
     assert config.issue_selection.respect_issue_dependencies is False
+
+
+def test_config_accepts_stacked_pr_selection():
+    config = config_from_dict(
+        {
+            "repo": "owner/repo",
+            "issue_selection": {
+                "allow_stacked_prs": True,
+                "max_stack_depth": 2,
+            },
+        }
+    )
+
+    assert config.issue_selection.allow_stacked_prs is True
+    assert config.issue_selection.max_stack_depth == 2
+
+
+def test_config_rejects_invalid_stack_depth():
+    with pytest.raises(ConfigError, match="issue_selection.max_stack_depth"):
+        config_from_dict({"repo": "owner/repo", "issue_selection": {"max_stack_depth": 0}})
 
 
 def test_config_rejects_invalid_review_max_iterations():

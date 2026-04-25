@@ -36,6 +36,8 @@ class IssueSelectionConfig:
     pr_opened_label: str = "ai-pr-opened"
     blocked_labels: list[str] = field(default_factory=lambda: ["blocked", "needs-human"])
     respect_issue_dependencies: bool = True
+    allow_stacked_prs: bool = False
+    max_stack_depth: int = 3
     max_issues_per_run: int = 1
     selection_order: str = "oldest_updated"
 
@@ -170,6 +172,8 @@ def config_from_dict(data: dict[str, Any]) -> WorkerConfig:
         raise ConfigError(f"agent.reasoning must be one of: {allowed}")
     if config.review.max_iterations < 1:
         raise ConfigError("review.max_iterations must be at least 1")
+    if config.issue_selection.max_stack_depth < 1:
+        raise ConfigError("issue_selection.max_stack_depth must be at least 1")
     invalid_priorities = [priority for priority in config.review.fix_priorities if priority not in {"P0", "P1"}]
     if invalid_priorities:
         raise ConfigError("review.fix_priorities must contain only P0 or P1")

@@ -38,6 +38,17 @@ By default, candidates exclude issues that have open native GitHub issue
 dependencies in their `blocked by` relationship, in addition to excluding
 configured blocked labels such as `blocked` and `needs-human`.
 
+To let the worker continue through a dependency chain, enable stacked PRs. In
+this mode, an issue with exactly one open blocker can be selected after that
+blocker has an ai-issue PR open; the downstream worktree is based on the
+blocker's branch and its PR targets that branch:
+
+```yaml
+issue_selection:
+  allow_stacked_prs: true
+  max_stack_depth: 3
+```
+
 To use label-only selection, disable the dependency check:
 
 ```yaml

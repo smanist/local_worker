@@ -102,6 +102,7 @@ def _usage_from_text(text: str) -> TokenUsage | None:
             r"\btotal[ _-]?tokens?\b\s*[:=]\s*(\d[\d,]*)",
             r"\btotal\b\s*[:=]\s*(\d[\d,]*)\s*tokens?\b",
             r"\b(\d[\d,]*)[ \t]+total[ _-]?tokens?\b",
+            r"\btokens[ \t]+used\b\s*(?:\r?\n)+\s*(\d[\d,]*)",
         ],
     )
     if total_tokens is None and input_tokens is not None and output_tokens is not None:

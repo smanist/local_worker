@@ -62,3 +62,15 @@ def test_codex_token_usage_records_run_and_total(tmp_path: Path):
     assert "tokens codex-20260423.log: input=100 output=20 total=120" in log
     assert "tokens codex-20260423-review-1.log: input=10 output=5 total=15" in log
     assert "tokens total: input=110 output=25 total=135 across 2/2 codex run(s)" in log
+
+
+def test_codex_token_usage_parses_codex_tokens_used_summary(tmp_path: Path):
+    log_path = tmp_path / "codex-20260426-005740.log"
+    log_path.write_text("some output\n\ntokens used\n23,690\n", encoding="utf-8")
+    record_artifact_file(log_path)
+    record_codex_token_usage(tmp_path, log_path)
+
+    log = (tmp_path / "artifacts.log").read_text(encoding="utf-8")
+
+    assert "tokens codex-20260426-005740.log: total=23690" in log
+    assert "tokens total: total=23690 across 1/1 codex run(s)" in log

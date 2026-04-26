@@ -11,15 +11,21 @@ MAX_INSTRUCTION_CHARS = 12_000
 
 
 def repository_instructions(repo_root: Path) -> str:
+    agents_path = repo_root / "AGENTS.md"
+    if agents_path.exists() and agents_path.is_file():
+        text = agents_path.read_text(encoding="utf-8", errors="replace")
+        return f"## AGENTS.md\n\n{text.strip()}"[:MAX_INSTRUCTION_CHARS]
+
     parts: list[str] = []
-    for name in ["AGENTS.md", "CONTRIBUTING.md", "README.md", "pyproject.toml"]:
+    for name, limit in {
+        "CONTRIBUTING.md": 2_000,
+        "README.md": 3_000,
+        "pyproject.toml": 2_000,
+    }.items():
         path = repo_root / name
         if path.exists() and path.is_file():
             text = path.read_text(encoding="utf-8", errors="replace")
-            if name == "AGENTS.md":
-                snippet = text
-            else:
-                snippet = text[:3000]
+            snippet = text if limit is None else text[:limit]
             parts.append(f"## {name}\n\n{snippet.strip()}")
     joined = "\n\n".join(parts).strip()
     return joined[:MAX_INSTRUCTION_CHARS] if joined else "No repository instruction files were found."

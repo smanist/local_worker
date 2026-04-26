@@ -2,7 +2,13 @@ from pathlib import Path
 
 from ai_issue_worker.config import config_from_dict
 from ai_issue_worker.models import CommandResult, DiffSummary, Issue, VerifyResult
-from ai_issue_worker.prompt import build_issue_draft_prompt, build_prompt, build_review_fix_prompt, build_review_prompt
+from ai_issue_worker.prompt import (
+    build_issue_draft_prompt,
+    build_prompt,
+    build_review_fix_prompt,
+    build_review_prompt,
+    repository_instructions,
+)
 
 
 def test_prompt_contains_issue_and_constraints(tmp_path: Path):
@@ -62,3 +68,27 @@ def test_issue_draft_prompt_requires_json_output(tmp_path: Path):
     assert "parser crashes on empty input" in prompt
     assert "Title hint: Parser crash on empty input" in prompt
     assert "Parser project." in prompt
+
+
+def test_repository_instructions_prefers_agents_only_when_present(tmp_path: Path):
+    (tmp_path / "AGENTS.md").write_text("Agent instructions.", encoding="utf-8")
+    (tmp_path / "ARCHITECTURE.md").write_text("Architecture notes.", encoding="utf-8")
+    (tmp_path / "OPERATIONS.md").write_text("Operations notes.", encoding="utf-8")
+    (tmp_path / "README.md").write_text("Readme notes.", encoding="utf-8")
+
+    instructions = repository_instructions(tmp_path)
+
+    assert "## AGENTS.md" in instructions
+    assert "Agent instructions." in instructions
+    assert "## README.md" not in instructions
+    assert "Architecture notes." not in instructions
+    assert "Operations notes." not in instructions
+
+
+def test_repository_instructions_fall_back_to_readme_when_agents_missing(tmp_path: Path):
+    (tmp_path / "README.md").write_text("Readme notes.", encoding="utf-8")
+
+    instructions = repository_instructions(tmp_path)
+
+    assert "## README.md" in instructions
+    assert "Readme notes." in instructions

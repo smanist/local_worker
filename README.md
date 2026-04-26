@@ -111,6 +111,12 @@ read-only Codex sandbox. If that review reports configured blocking priorities,
 the worker runs a separate Codex fix session, verifies again, and repeats until
 the review is clean or `review.max_iterations` fix passes have been used.
 
+Each issue run directory also contains `artifacts.log`, a timestamped manifest of
+generated run artifacts such as prompts, Codex logs, verifier logs, review files,
+job records, PR bodies, and latest-file updates. After each Codex session, the
+manifest records token usage when the configured Codex command exposes it in
+stdout/stderr, plus a cumulative total across Codex logs in that issue directory.
+
 Start a simple background loop:
 
 ```bash

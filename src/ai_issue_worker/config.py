@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[reportMissingModuleSource]
 
 
 DEFAULT_CONFIG_PATH = ".ai-issue-worker.yaml"

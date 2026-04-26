@@ -1,6 +1,6 @@
 from pathlib import Path
 
-import pytest
+import pytest  # type: ignore[reportMissingImports]
 
 from ai_issue_worker.shell import run_cmd
 from ai_issue_worker.worktree import GitError, ensure_git_ok

@@ -3,16 +3,16 @@ from __future__ import annotations
 import hashlib
 import re
 import shlex
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from .codex_backend import CodexBackend
 from .config import ConfigError, IssueSelectionConfig, WorkerConfig, load_config
 from .diff_policy import inspect_diff
 from .github_gh import GHClient, GHError
 from .issue_selection import candidate_issues
-from .jobs import issue_run_dir, load_job_record, utc_iso, utc_timestamp, write_job_record, write_text_artifact
+from .jobs import copy_artifact, issue_run_dir, load_job_record, record_artifact_file, record_codex_token_usage, utc_iso, utc_timestamp, write_job_record, write_single_artifact, write_text_artifact
 from .locking import FileLock, LockHeld
 from .models import DiffSummary, Issue, JobRecord, VerifyResult
 from .pr import build_pr_body, render_template
@@ -39,6 +39,10 @@ REVIEW_FINDING_RE = re.compile(r"^\s*(?:[-*]\s*)?(?:\[(P[0-3])\]|(P[0-3])\s*[:\-
 
 class DependencyError(RuntimeError):
     pass
+
+
+class IssueDependencyClient(Protocol):
+    def blocked_by(self, number: int) -> list[Issue]: ...
 
 
 class RunOverrides:
@@ -110,7 +114,7 @@ def check_dependencies(config: WorkerConfig, root: Path | None = None, paths: di
 
 def _comment_failure(gh: GHClient, issue: Issue, run_dir: Path, message: str) -> None:
     comment = run_dir / "failure-comment.md"
-    comment.write_text(sanitize_user_paths(message), encoding="utf-8")
+    write_single_artifact(comment, sanitize_user_paths(message))
     try:
         gh.comment(issue.number, comment)
     except GHError:
@@ -163,7 +167,7 @@ def _record_for(issue: Issue, branch: str, worktree_path: Path, plan: IssueWorkP
     )
 
 
-def _open_blockers(gh: GHClient, issue: Issue) -> list[Issue]:
+def _open_blockers(gh: IssueDependencyClient, issue: Issue) -> list[Issue]:
     return [blocker for blocker in gh.blocked_by(issue.number) if blocker.state.lower() == "open"]
 
 
@@ -181,7 +185,7 @@ def _latest_pr_job(paths: dict[str, Path], issue_number: int) -> JobRecord | Non
 
 
 def _work_plan_for_issue(
-    gh: GHClient,
+    gh: IssueDependencyClient,
     issue: Issue,
     config: IssueSelectionConfig,
     base_branch: str,
@@ -207,7 +211,7 @@ def _work_plan_for_issue(
 
 
 def workable_issue_plans(
-    gh: GHClient,
+    gh: IssueDependencyClient,
     issues: list[Issue],
     config: IssueSelectionConfig,
     base_branch: str,
@@ -223,7 +227,7 @@ def workable_issue_plans(
 
 
 def workable_issues(
-    gh: GHClient,
+    gh: IssueDependencyClient,
     issues: list[Issue],
     config: IssueSelectionConfig,
     base_branch: str,
@@ -233,7 +237,7 @@ def workable_issues(
 
 
 def select_work_plan(
-    gh: GHClient,
+    gh: IssueDependencyClient,
     issues: list[Issue],
     config: IssueSelectionConfig,
     base_branch: str,
@@ -276,7 +280,9 @@ def _run_codex_session(
     )
     result = backend.run(worktree_path, prompt_path, timeout_sec=config.agent.timeout_minutes * 60)
     if log_path.exists():
-        shutil.copyfile(log_path, log_path.parent / "codex.log")
+        record_artifact_file(log_path)
+        copy_artifact(log_path, log_path.parent / "codex.log")
+        record_codex_token_usage(log_path.parent, log_path)
     return result
 
 
@@ -312,8 +318,9 @@ def _run_verification_with_repairs(
 ) -> tuple[bool, VerifyResult, DiffSummary, str, str]:
     verify_log = run_dir / f"verify-{stamp}.log"
     verify = run_verifier(config.verify, worktree_path, verify_log)
+    record_artifact_file(verify_log)
     latest_verify = run_dir / "verify.log"
-    latest_verify.write_text(verify_log.read_text(encoding="utf-8"), encoding="utf-8")
+    copy_artifact(verify_log, latest_verify)
     diff = inspect_diff(worktree_path, config.diff_policy)
 
     repairs = 0
@@ -333,7 +340,8 @@ def _run_verification_with_repairs(
             return False, verify, diff, f"Repair attempt failed with exit code {repair.exit_code}.", "agent"
         verify_log = run_dir / f"verify-{repair_stamp}.log"
         verify = run_verifier(config.verify, worktree_path, verify_log)
-        latest_verify.write_text(verify_log.read_text(encoding="utf-8"), encoding="utf-8")
+        record_artifact_file(verify_log)
+        copy_artifact(verify_log, latest_verify)
         diff = inspect_diff(worktree_path, config.diff_policy)
 
     return verify.passed, verify, diff, "" if verify.passed else "Verification failed.", "verify"
@@ -501,6 +509,7 @@ def process_issue(config: WorkerConfig, plan: IssueWorkPlan, repo_root: Path, pa
         _write_record(run_dir, record, "failed", str(exc))
         return EXIT_GIT
 
+    assert verify is not None
     verification_summary = format_verification_summary(verify)
     pr_body = build_pr_body(config.pr, issue, verification_summary, diff)
     pr_body_path = run_dir / f"pr-body-{stamp}.md"
@@ -520,7 +529,7 @@ def process_issue(config: WorkerConfig, plan: IssueWorkPlan, repo_root: Path, pa
         if config.git.remove_ready_on_pr:
             gh.remove_label(issue.number, config.issue_selection.ready_label)
         comment = run_dir / "success-comment.md"
-        comment.write_text(f"Draft PR opened: {pr_url}\n", encoding="utf-8")
+        write_single_artifact(comment, f"Draft PR opened: {pr_url}\n")
         gh.comment(issue.number, comment)
     except GHError:
         pass

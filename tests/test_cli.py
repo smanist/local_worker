@@ -105,6 +105,7 @@ def test_run_once_passes_model_and_reasoning_overrides(tmp_path: Path, monkeypat
     captured = {}
 
     def fake_run_once(config_path, repo_root=None, overrides=None):
+        assert overrides is not None
         captured["config_path"] = config_path
         captured["repo_root"] = repo_root
         captured["model"] = overrides.model

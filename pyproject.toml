@@ -23,3 +23,6 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 
+[tool.pyright]
+pythonVersion = "3.11"
+extraPaths = ["src"]

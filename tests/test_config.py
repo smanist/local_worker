@@ -1,6 +1,6 @@
 from pathlib import Path
 
-import pytest
+import pytest  # type: ignore[reportMissingImports]
 
 from ai_issue_worker.config import ConfigError, config_from_dict, load_config, write_default_config
 

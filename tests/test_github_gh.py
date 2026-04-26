@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from ai_issue_worker.github_gh import GHClient
 
@@ -101,3 +102,24 @@ def test_ensure_labels_creates_or_updates_each_label(monkeypatch):
             "--force",
         ],
     ]
+
+
+def test_create_pr_sanitizes_body_file_before_pushing(monkeypatch, tmp_path: Path):
+    captured = {}
+    body = tmp_path / "body.md"
+    body.write_text("Verifier failed in /Users/alice/Repos/project/src/app.py\n", encoding="utf-8")
+
+    def fake_run_cmd(args):
+        body_path = Path(args[args.index("--body-file") + 1])
+        captured["body"] = body_path.read_text(encoding="utf-8")
+        captured["args"] = args
+        return Result("https://github.com/owner/repo/pull/1\n")
+
+    monkeypatch.setattr("ai_issue_worker.github_gh.run_cmd", fake_run_cmd)
+
+    url = GHClient("owner/repo").create_pr("main", "ai/issue-1", "Title", body)
+
+    assert url == "https://github.com/owner/repo/pull/1"
+    assert "/Users/alice" not in captured["body"]
+    assert "####/Repos/project/src/app.py" in captured["body"]
+    assert captured["args"][captured["args"].index("--body-file") + 1] != str(body)

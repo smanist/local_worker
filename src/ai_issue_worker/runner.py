@@ -16,6 +16,7 @@ from .jobs import issue_run_dir, load_job_record, utc_iso, utc_timestamp, write_
 from .locking import FileLock, LockHeld
 from .models import DiffSummary, Issue, JobRecord, VerifyResult
 from .pr import build_pr_body, render_template
+from .privacy import sanitize_user_paths
 from .prompt import build_prompt, build_repair_prompt, build_review_fix_prompt, build_review_prompt
 from .shell import run_cmd
 from .verifier import format_verification_summary, run_verifier
@@ -109,7 +110,7 @@ def check_dependencies(config: WorkerConfig, root: Path | None = None, paths: di
 
 def _comment_failure(gh: GHClient, issue: Issue, run_dir: Path, message: str) -> None:
     comment = run_dir / "failure-comment.md"
-    comment.write_text(message, encoding="utf-8")
+    comment.write_text(sanitize_user_paths(message), encoding="utf-8")
     try:
         gh.comment(issue.number, comment)
     except GHError:

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from .models import Issue
+from .privacy import sanitize_user_paths
 from .shell import run_cmd
 
 
@@ -31,6 +34,24 @@ class GHClient:
         if result.exit_code != 0:
             raise GHError(result.stderr.strip() or result.stdout.strip() or f"gh command failed: {result.command}")
         return result
+
+    @contextmanager
+    def _sanitized_body_file(self, body_file: Path):
+        body = body_file.read_text(encoding="utf-8", errors="replace")
+        sanitized = sanitize_user_paths(body)
+        if sanitized == body:
+            yield body_file
+            return
+
+        temp_path: Path | None = None
+        try:
+            with NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+                handle.write(sanitized)
+                temp_path = Path(handle.name)
+            yield temp_path
+        finally:
+            if temp_path:
+                temp_path.unlink(missing_ok=True)
 
     def validate(self) -> None:
         self._run(["gh", "auth", "status"])
@@ -116,7 +137,8 @@ class GHClient:
             self.ensure_label(name, color, description)
 
     def comment(self, number: int, body_file: Path) -> None:
-        self._run(["gh", "issue", "comment", str(number), "--repo", self.repo, "--body-file", str(body_file)])
+        with self._sanitized_body_file(body_file) as sanitized:
+            self._run(["gh", "issue", "comment", str(number), "--repo", self.repo, "--body-file", str(sanitized)])
 
     def create_issue(self, title: str, body_file: Path, labels: list[str] | None = None) -> str:
         args = [
@@ -126,13 +148,15 @@ class GHClient:
             "--repo",
             self.repo,
             "--title",
-            title,
-            "--body-file",
-            str(body_file),
+            sanitize_user_paths(title),
         ]
+        body_index = len(args)
+        args.extend(["--body-file", ""])
         for label in labels or []:
             args.extend(["--label", label])
-        result = self._run(args)
+        with self._sanitized_body_file(body_file) as sanitized:
+            args[body_index + 1] = str(sanitized)
+            result = self._run(args)
         return result.stdout.strip().splitlines()[-1]
 
     def create_pr(
@@ -154,11 +178,13 @@ class GHClient:
             "--head",
             head,
             "--title",
-            title,
-            "--body-file",
-            str(body_file),
+            sanitize_user_paths(title),
         ]
+        body_index = len(args)
+        args.extend(["--body-file", ""])
         if draft:
             args.append("--draft")
-        result = self._run(args)
+        with self._sanitized_body_file(body_file) as sanitized:
+            args[body_index + 1] = str(sanitized)
+            result = self._run(args)
         return result.stdout.strip().splitlines()[-1]

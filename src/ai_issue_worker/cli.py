@@ -26,6 +26,9 @@ from .shell import run_cmd
 from .worktree import GitError, remove_worktree
 
 
+AI_ISSUE_GITIGNORE_ENTRIES = [".ai-logs", ".ai-runs", ".ai-runtime", ".ai-worktrees"]
+
+
 def parse_interval_minutes(value: str) -> int:
     raw = value.strip().lower()
     if raw.endswith("m"):
@@ -128,6 +131,20 @@ def _automation_label_specs(config) -> dict[str, tuple[str, str]]:
     for label in labels.blocked_labels:
         add(label, "FBCA04", "Blocked from local AI issue worker selection until human action is taken.")
     return specs
+
+
+def _ensure_gitignore_entries(path: Path = Path(".gitignore")) -> None:
+    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    present = {line.strip() for line in existing}
+    missing = [entry for entry in AI_ISSUE_GITIGNORE_ENTRIES if entry not in present]
+    if not missing:
+        return
+
+    output = "\n".join(existing).rstrip()
+    if output:
+        output += "\n\n"
+    output += "# Local AI Issue Worker artifacts\n" + "\n".join(missing) + "\n"
+    path.write_text(output, encoding="utf-8")
 
 
 def _first_nonempty_line(text: str) -> str:
@@ -266,8 +283,12 @@ def cmd_init(args) -> int:
     path = Path(args.path)
     try:
         write_default_config(path, force=args.force, repo=repo, base_branch=base_branch)
+        _ensure_gitignore_entries()
     except ConfigError as exc:
         print(exc, file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"failed to update .gitignore: {exc}", file=sys.stderr)
         return 1
     print(f"created {args.path}")
     if repo == "owner/repo":

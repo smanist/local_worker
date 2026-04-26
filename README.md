@@ -33,7 +33,9 @@ base_branch: main
 It also creates or updates the GitHub labels used by the automation, including
 `ai-ready`, `ai-working`, `ai-failed`, and `ai-pr-opened`, when `gh` is
 authenticated for the inferred repo. Use `--repo`, `--base-branch`, or
-`--no-create-labels` to override those defaults.
+`--no-create-labels` to override those defaults. It appends the local artifact
+directories `.ai-logs`, `.ai-runs`, `.ai-runtime`, and `.ai-worktrees` to
+`.gitignore`.
 
 List candidate issues:
 
@@ -121,3 +123,6 @@ ai-issue stop
 ## Safety
 
 V1 is not sandboxed. Run it only on trusted repositories and keep draft PR review enabled. The worker does not auto-merge.
+
+GitHub issue comments, issue bodies, and PR bodies are scrubbed before upload to
+mask local user-home paths such as `/Users/name/...`.

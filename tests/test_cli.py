@@ -16,14 +16,38 @@ class FakeGH:
         return []
 
 
-def test_cli_init_smoke(tmp_path: Path):
-    path = tmp_path / "config.yaml"
-    assert cli.main(["init", "--path", str(path), "--no-create-labels"]) == 0
-    assert path.exists()
+def test_cli_init_smoke(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["init", "--path", "config.yaml", "--no-create-labels"]) == 0
+    assert (tmp_path / "config.yaml").exists()
+    gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    assert ".ai-logs" in gitignore
+    assert ".ai-runs" in gitignore
+    assert ".ai-runtime" in gitignore
+    assert ".ai-worktrees" in gitignore
+
+
+def test_cli_init_appends_missing_gitignore_entries_once(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("dist\n.ai-runs\n", encoding="utf-8")
+
+    assert cli.main(["init", "--path", "config.yaml", "--no-create-labels"]) == 0
+    assert cli.main(["init", "--path", "config.yaml", "--force", "--no-create-labels"]) == 0
+
+    lines = gitignore.read_text(encoding="utf-8").splitlines()
+    assert lines.count(".ai-runs") == 1
+    assert lines.count(".ai-logs") == 1
+    assert lines.count(".ai-runtime") == 1
+    assert lines.count(".ai-worktrees") == 1
 
 
 def test_cli_init_infers_repo_and_branch_and_creates_labels(tmp_path: Path, monkeypatch):
-    path = tmp_path / "config.yaml"
+    monkeypatch.chdir(tmp_path)
+
+    path = Path("config.yaml")
     captured = {}
 
     def fake_run_cmd(args):
@@ -45,7 +69,7 @@ def test_cli_init_infers_repo_and_branch_and_creates_labels(tmp_path: Path, monk
 
     assert cli.main(["init", "--path", str(path)]) == 0
 
-    config = load_config(path)
+    config = load_config(tmp_path / path)
     assert config.repo == "acme/widget"
     assert config.base_branch == "trunk"
     assert captured["repo"] == "acme/widget"

@@ -9,7 +9,8 @@ class FakeGH:
     def __init__(self, repo: str):
         self.repo = repo
 
-    def list_issues(self, ready_label: str):
+    def list_issues(self, labels):
+        ready_label = labels[0] if isinstance(labels, list) else labels
         return [Issue(1, "Ready", "", [ready_label], "open", updated_at="2026-01-01T00:00:00Z")]
 
     def blocked_by(self, number: int):
@@ -73,7 +74,7 @@ def test_cli_init_infers_repo_and_branch_and_creates_labels(tmp_path: Path, monk
     assert config.repo == "acme/widget"
     assert config.base_branch == "trunk"
     assert captured["repo"] == "acme/widget"
-    assert set(captured["labels"]) >= {"ai-ready", "ai-working", "ai-failed", "ai-pr-opened", "blocked", "needs-human"}
+    assert set(captured["labels"]) >= {"ai-ready", "ai-resume", "ai-working", "ai-failed", "ai-pr-opened", "blocked", "needs-human"}
 
 
 def test_repo_from_remote_url_supports_github_and_enterprise_remotes():
@@ -118,6 +119,60 @@ def test_run_once_passes_model_and_reasoning_overrides(tmp_path: Path, monkeypat
     assert captured["config_path"] == Path(".ai-issue-worker.yaml")
     assert captured["model"] == "gpt-5.4"
     assert captured["reasoning"] == "xhigh"
+
+
+def test_resume_passes_comment_and_overrides(tmp_path: Path, monkeypatch):
+    path = tmp_path / ".ai-issue-worker.yaml"
+    path.write_text("repo: owner/repo\n", encoding="utf-8")
+    captured = {}
+
+    def fake_resume_issue(config_path, issue_number, manual_note="", repo_root=None, overrides=None):
+        assert overrides is not None
+        captured["config_path"] = config_path
+        captured["issue_number"] = issue_number
+        captured["manual_note"] = manual_note
+        captured["model"] = overrides.model
+        captured["reasoning"] = overrides.reasoning
+        return 0
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "resume_issue", fake_resume_issue)
+
+    assert cli.main(["resume", "123", "--comment", "Address the reviewer notes", "--model", "gpt-5.4-mini", "--reasoning", "high"]) == 0
+    assert captured["config_path"] == Path(".ai-issue-worker.yaml")
+    assert captured["issue_number"] == 123
+    assert captured["manual_note"] == "Address the reviewer notes"
+    assert captured["model"] == "gpt-5.4-mini"
+    assert captured["reasoning"] == "high"
+
+
+def test_resume_queue_adds_resume_label_and_comment(tmp_path: Path, monkeypatch, capsys):
+    path = tmp_path / ".ai-issue-worker.yaml"
+    path.write_text("repo: owner/repo\n", encoding="utf-8")
+    captured = {}
+
+    class FakeResumeQueueGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def comment(self, number: int, body_file: Path):
+            captured["issue"] = number
+            captured["comment"] = body_file.read_text(encoding="utf-8")
+
+        def remove_label(self, number: int, label: str):
+            captured.setdefault("removed", []).append((number, label))
+
+        def add_label(self, number: int, label: str):
+            captured.setdefault("added", []).append((number, label))
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "GHClient", FakeResumeQueueGH)
+
+    assert cli.main(["resume", "123", "--queue", "--comment", "Please address the latest review."]) == 0
+    assert captured["issue"] == 123
+    assert captured["comment"] == "Please address the latest review.\n"
+    assert captured["added"] == [(123, "ai-resume")]
+    assert "issue #123 queued for resume" in capsys.readouterr().out
 
 
 def test_cli_create_issue_uses_ready_label_and_generated_body(tmp_path: Path, monkeypatch, capsys):

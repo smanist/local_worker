@@ -24,6 +24,18 @@ def test_prompt_contains_issue_and_constraints(tmp_path: Path):
     assert "Do not create branches or pull requests" in prompt
 
 
+def test_prompt_includes_follow_up_context_when_present(tmp_path: Path):
+    config = config_from_dict({"repo": "owner/repo", "verify": {"commands": ["pytest"]}})
+    (tmp_path / "AGENTS.md").write_text("Follow local instructions.", encoding="utf-8")
+    issue = Issue(123, "Bug title", "Bug body", ["ai-ready"], "open")
+
+    prompt = build_prompt(issue, config, tmp_path, follow_up="Continue on the existing PR.\n\nAddress the reviewer note.")
+
+    assert "## Continuation context" in prompt
+    assert "Continue on the existing PR." in prompt
+    assert "Address the reviewer note." in prompt
+
+
 def test_review_prompt_requests_structured_blocking_priorities(tmp_path: Path):
     config = config_from_dict({"repo": "owner/repo", "review": {"fix_priorities": ["P0", "P1"]}})
     (tmp_path / "AGENTS.md").write_text("Follow local instructions.", encoding="utf-8")

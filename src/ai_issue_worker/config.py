@@ -31,6 +31,7 @@ class SchedulerConfig:
 @dataclass
 class IssueSelectionConfig:
     ready_label: str = "ai-ready"
+    resume_label: str = "ai-resume"
     working_label: str = "ai-working"
     failed_label: str = "ai-failed"
     pr_opened_label: str = "ai-pr-opened"

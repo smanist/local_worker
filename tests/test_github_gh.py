@@ -123,3 +123,78 @@ def test_create_pr_sanitizes_body_file_before_pushing(monkeypatch, tmp_path: Pat
     assert "/Users/alice" not in captured["body"]
     assert "####/Repos/project/src/app.py" in captured["body"]
     assert captured["args"][captured["args"].index("--body-file") + 1] != str(body)
+
+
+def test_issue_comments_uses_issue_comments_api(monkeypatch):
+    captured = {}
+
+    def fake_run_cmd(args):
+        captured["args"] = args
+        return Result(json.dumps([[{"body": "Please fix", "created_at": "2026-01-01T00:00:00Z", "user": {"login": "alice"}}]]))
+
+    monkeypatch.setattr("ai_issue_worker.github_gh.run_cmd", fake_run_cmd)
+
+    comments = GHClient("owner/repo").issue_comments(7)
+
+    assert captured["args"] == [
+        "gh",
+        "api",
+        "repos/owner/repo/issues/7/comments",
+        "--paginate",
+        "--slurp",
+    ]
+    assert len(comments) == 1
+    assert comments[0].source == "issue comment"
+    assert comments[0].author == "alice"
+    assert comments[0].body == "Please fix"
+
+
+def test_pr_reviews_uses_reviews_api(monkeypatch):
+    captured = {}
+
+    def fake_run_cmd(args):
+        captured["args"] = args
+        return Result(json.dumps([[{"body": "Needs another test", "submitted_at": "2026-01-02T00:00:00Z", "user": {"login": "bob"}}]]))
+
+    monkeypatch.setattr("ai_issue_worker.github_gh.run_cmd", fake_run_cmd)
+
+    reviews = GHClient("owner/repo").pr_reviews("https://github.com/owner/repo/pull/17")
+
+    assert captured["args"] == [
+        "gh",
+        "api",
+        "repos/owner/repo/pulls/17/reviews",
+        "--paginate",
+        "--slurp",
+    ]
+    assert len(reviews) == 1
+    assert reviews[0].source == "pull request review"
+    assert reviews[0].author == "bob"
+    assert reviews[0].body == "Needs another test"
+
+
+def test_update_pr_sanitizes_body_file_before_edit(monkeypatch, tmp_path: Path):
+    captured = {}
+    body = tmp_path / "body.md"
+    body.write_text("Updated in /Users/alice/Repos/project/src/app.py\n", encoding="utf-8")
+
+    def fake_run_cmd(args):
+        body_path = Path(args[args.index("--body-file") + 1])
+        captured["body"] = body_path.read_text(encoding="utf-8")
+        captured["args"] = args
+        return Result("")
+
+    monkeypatch.setattr("ai_issue_worker.github_gh.run_cmd", fake_run_cmd)
+
+    GHClient("owner/repo").update_pr("https://github.com/owner/repo/pull/2", "Updated Title", body)
+
+    assert captured["args"][:6] == [
+        "gh",
+        "pr",
+        "edit",
+        "https://github.com/owner/repo/pull/2",
+        "--repo",
+        "owner/repo",
+    ]
+    assert "/Users/alice" not in captured["body"]
+    assert "####/Repos/project/src/app.py" in captured["body"]

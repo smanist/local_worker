@@ -11,6 +11,7 @@ def test_default_config_generation_works(tmp_path: Path):
     config = load_config(path)
     assert config.repo == "owner/repo"
     assert config.issue_selection.ready_label == "ai-ready"
+    assert config.issue_selection.resume_label == "ai-resume"
     assert config.issue_selection.respect_issue_dependencies is True
     assert config.issue_selection.allow_stacked_prs is False
     assert config.issue_selection.max_stack_depth == 3

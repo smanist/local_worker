@@ -31,8 +31,15 @@ def repository_instructions(repo_root: Path) -> str:
     return joined[:MAX_INSTRUCTION_CHARS] if joined else "No repository instruction files were found."
 
 
-def build_prompt(issue: Issue, config: WorkerConfig, repo_root: Path) -> str:
+def build_prompt(issue: Issue, config: WorkerConfig, repo_root: Path, follow_up: str = "") -> str:
     verify_commands = "\n".join(f"- `{command}`" for command in config.verify.commands)
+    follow_up_section = ""
+    if follow_up.strip():
+        follow_up_section = f"""
+## Continuation context
+
+{follow_up.strip()}
+"""
     return f"""# Task
 
 You are working in a local git worktree for repository `{config.repo}`.
@@ -46,6 +53,7 @@ Fix GitHub issue #{issue.number}.
 ## Issue body
 
 {issue.body}
+{follow_up_section}
 
 ## Constraints
 

@@ -1,6 +1,6 @@
 # Local AI Issue Worker
 
-`local-ai-issue-worker` is a local CLI that processes GitHub issues labeled for AI work. It uses `gh` for GitHub operations, `git worktree` for isolated changes, a configurable Codex CLI backend for edits, local verifier commands, and draft pull requests for human review.
+`local-ai-issue-worker` is a local CLI that processes GitHub issues labeled for AI work. It uses `gh` for GitHub operations, `git worktree` for isolated changes, a configurable Codex CLI backend for edits, local verifier commands, and draft pull requests for human review. It can also resume work on an existing ai-issue PR with follow-up instructions from local operator notes, issue comments, and PR discussion, either immediately or through the normal background queue.
 
 ## Install
 
@@ -31,7 +31,7 @@ base_branch: main
 ```
 
 It also creates or updates the GitHub labels used by the automation, including
-`ai-ready`, `ai-working`, `ai-failed`, and `ai-pr-opened`, when `gh` is
+`ai-ready`, `ai-resume`, `ai-working`, `ai-failed`, and `ai-pr-opened`, when `gh` is
 authenticated for the inferred repo. Use `--repo`, `--base-branch`, or
 `--no-create-labels` to override those defaults. It appends the local artifact
 directories `.ai-logs`, `.ai-runs`, `.ai-runtime`, and `.ai-worktrees` to
@@ -125,6 +125,20 @@ ai-issue status
 ai-issue logs
 ai-issue stop
 ```
+
+Resume work on an existing ai-issue PR for a specific issue. The worker reuses the recorded branch/worktree for that issue, includes new issue comments and PR review discussion since the last worker run, accepts an optional local operator note, and updates the existing PR instead of opening a new one:
+
+```bash
+ai-issue resume 123 --comment "Address the latest review feedback and keep the API unchanged."
+```
+
+Queue that same follow-up work for the normal `run-once` / `start` scheduler path instead of running it immediately:
+
+```bash
+ai-issue resume 123 --queue --comment "Address the latest review feedback and keep the API unchanged."
+```
+
+Queued resume work is represented by the `ai-resume` label. The command above also posts the optional note as a GitHub issue comment so a later background run can include it in the continuation prompt.
 
 ## Safety
 

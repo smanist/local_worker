@@ -35,7 +35,7 @@ The codebase is structured as a thin set of adapters around one orchestrator. Th
 
 - Parses subcommands.
 - Handles config bootstrapping in `init`.
-- Exposes manual/operator commands such as `inspect`, `retry`, and `clean`.
+- Exposes manual/operator commands such as `inspect`, `retry`, `resume`, and `clean`.
 - Starts or stops the daemon.
 - Delegates all issue execution to `runner.run_once()`.
 
@@ -51,6 +51,8 @@ This is the repo's center of gravity.
 - Applies diff policy.
 - Writes job records and artifact logs.
 - Finalizes GitHub labels/comments and git cleanup.
+- Supports explicit continuation of an existing ai-issue PR by reusing the recorded branch/worktree and updating the existing PR instead of opening a new one.
+- Supports queued continuation work through the `ai-resume` label so the daemon and `run-once` path can process PR revisions alongside new issues.
 
 When making behavioral changes, start here and verify the corresponding tests in `tests/test_runner_review.py`.
 

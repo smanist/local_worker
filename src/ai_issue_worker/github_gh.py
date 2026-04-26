@@ -5,8 +5,9 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from urllib.parse import urlparse
 
-from .models import Issue
+from .models import DiscussionComment, Issue
 from .privacy import sanitize_user_paths
 from .shell import run_cmd
 
@@ -35,6 +36,26 @@ class GHClient:
             raise GHError(result.stderr.strip() or result.stdout.strip() or f"gh command failed: {result.command}")
         return result
 
+    def _paginated_items(self, args: list[str]) -> list[dict]:
+        result = self._run([*args, "--paginate", "--slurp"])
+        data = json.loads(result.stdout or "[]")
+        if data and all(isinstance(page, list) for page in data):
+            return [item for page in data for item in page]
+        if isinstance(data, list):
+            return data
+        return []
+
+    @staticmethod
+    def _pr_number_from_url(pr_url: str) -> int:
+        path = urlparse(pr_url).path.rstrip("/")
+        parts = [part for part in path.split("/") if part]
+        if len(parts) < 2 or parts[-2] != "pull":
+            raise GHError(f"could not parse pull request number from URL: {pr_url}")
+        try:
+            return int(parts[-1])
+        except ValueError as exc:
+            raise GHError(f"could not parse pull request number from URL: {pr_url}") from exc
+
     @contextmanager
     def _sanitized_body_file(self, body_file: Path):
         body = body_file.read_text(encoding="utf-8", errors="replace")
@@ -57,23 +78,29 @@ class GHClient:
         self._run(["gh", "auth", "status"])
         self._run(["gh", "repo", "view", self.repo])
 
-    def list_issues(self, ready_label: str) -> list[Issue]:
-        result = self._run(
-            [
-                "gh",
-                "issue",
-                "list",
-                "--repo",
-                self.repo,
-                "--state",
-                "open",
-                "--label",
-                ready_label,
-                "--json",
-                "number,title,body,labels,state,url,updatedAt",
-            ]
-        )
-        return [Issue.from_gh(item) for item in json.loads(result.stdout or "[]")]
+    def list_issues(self, labels: str | list[str]) -> list[Issue]:
+        requested = [labels] if isinstance(labels, str) else labels
+        items_by_number: dict[int, Issue] = {}
+        for label in requested:
+            result = self._run(
+                [
+                    "gh",
+                    "issue",
+                    "list",
+                    "--repo",
+                    self.repo,
+                    "--state",
+                    "open",
+                    "--label",
+                    label,
+                    "--json",
+                    "number,title,body,labels,state,url,updatedAt",
+                ]
+            )
+            for item in json.loads(result.stdout or "[]"):
+                issue = Issue.from_gh(item)
+                items_by_number[issue.number] = issue
+        return list(items_by_number.values())
 
     def view_issue(self, number: int) -> Issue:
         result = self._run(
@@ -92,22 +119,53 @@ class GHClient:
 
     def blocked_by(self, number: int) -> list[Issue]:
         hostname_args, repo_path = self._api_repo_args()
-        result = self._run(
+        items = self._paginated_items(
             [
                 "gh",
                 "api",
                 *hostname_args,
                 f"{repo_path}/issues/{number}/dependencies/blocked_by",
-                "--paginate",
-                "--slurp",
             ]
         )
-        data = json.loads(result.stdout or "[]")
-        if data and all(isinstance(page, list) for page in data):
-            items = [item for page in data for item in page]
-        else:
-            items = data
         return [Issue.from_gh(item) for item in items]
+
+    def issue_comments(self, number: int) -> list[DiscussionComment]:
+        hostname_args, repo_path = self._api_repo_args()
+        items = self._paginated_items(
+            [
+                "gh",
+                "api",
+                *hostname_args,
+                f"{repo_path}/issues/{number}/comments",
+            ]
+        )
+        return [DiscussionComment.from_gh(item, "issue comment") for item in items]
+
+    def pr_comments(self, pr_url: str) -> list[DiscussionComment]:
+        hostname_args, repo_path = self._api_repo_args()
+        pr_number = self._pr_number_from_url(pr_url)
+        items = self._paginated_items(
+            [
+                "gh",
+                "api",
+                *hostname_args,
+                f"{repo_path}/pulls/{pr_number}/comments",
+            ]
+        )
+        return [DiscussionComment.from_gh(item, "pull request comment") for item in items]
+
+    def pr_reviews(self, pr_url: str) -> list[DiscussionComment]:
+        hostname_args, repo_path = self._api_repo_args()
+        pr_number = self._pr_number_from_url(pr_url)
+        items = self._paginated_items(
+            [
+                "gh",
+                "api",
+                *hostname_args,
+                f"{repo_path}/pulls/{pr_number}/reviews",
+            ]
+        )
+        return [DiscussionComment.from_gh(item, "pull request review") for item in items if item.get("body")]
 
     def add_label(self, number: int, label: str) -> None:
         self._run(["gh", "issue", "edit", str(number), "--repo", self.repo, "--add-label", label])
@@ -188,3 +246,20 @@ class GHClient:
             args[body_index + 1] = str(sanitized)
             result = self._run(args)
         return result.stdout.strip().splitlines()[-1]
+
+    def update_pr(self, pr_url: str, title: str, body_file: Path) -> None:
+        args = [
+            "gh",
+            "pr",
+            "edit",
+            pr_url,
+            "--repo",
+            self.repo,
+            "--title",
+            sanitize_user_paths(title),
+        ]
+        body_index = len(args)
+        args.extend(["--body-file", ""])
+        with self._sanitized_body_file(body_file) as sanitized:
+            args[body_index + 1] = str(sanitized)
+            self._run(args)

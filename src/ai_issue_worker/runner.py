@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shlex
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -14,13 +15,13 @@ from .github_gh import GHClient, GHError
 from .issue_selection import candidate_issues
 from .jobs import copy_artifact, issue_run_dir, load_job_record, record_artifact_file, record_codex_token_usage, utc_iso, utc_timestamp, write_job_record, write_single_artifact, write_text_artifact
 from .locking import FileLock, LockHeld
-from .models import DiffSummary, Issue, JobRecord, VerifyResult
+from .models import DiffSummary, DiscussionComment, Issue, JobRecord, VerifyResult
 from .pr import build_pr_body, render_template
 from .privacy import sanitize_user_paths
 from .prompt import build_prompt, build_repair_prompt, build_review_fix_prompt, build_review_prompt
 from .shell import run_cmd
 from .verifier import format_verification_summary, run_verifier
-from .worktree import GitError, add_worktree, commit_all, push_branch, remove_worktree, unique_branch_name
+from .worktree import GitError, add_worktree, commit_all, ensure_worktree, push_branch, remove_worktree, unique_branch_name
 from .worktree import ensure_git_ok
 
 
@@ -35,6 +36,19 @@ EXIT_PR = 7
 EXIT_LOCK = 8
 
 REVIEW_FINDING_RE = re.compile(r"^\s*(?:[-*]\s*)?(?:\[(P[0-3])\]|(P[0-3])\s*[:\-])", re.MULTILINE)
+MAX_FOLLOW_UP_CHARS = 12_000
+WORKER_COMMENT_PREFIXES = (
+    "Draft PR opened:",
+    "Updated PR:",
+    "Git worktree setup failed:",
+    "Agent failed with exit code",
+    "Verification failed",
+    "Diff policy rejected the result:",
+    "PR creation failed:",
+    "PR update failed:",
+    "Git commit/push failed:",
+    "Code review still reports blocking findings after",
+)
 
 
 class DependencyError(RuntimeError):
@@ -57,6 +71,8 @@ class IssueWorkPlan:
     base_branch: str
     stack_depth: int = 0
     blocker_issue_numbers: list[int] | None = None
+    mode: str = "new"
+    resume_record: JobRecord | None = None
 
 
 def apply_overrides(config: WorkerConfig, overrides: RunOverrides | None = None) -> WorkerConfig:
@@ -148,7 +164,13 @@ def _write_record(run_dir: Path, record: JobRecord, status: str, error: str | No
     write_job_record(run_dir, record)
 
 
-def _record_for(issue: Issue, branch: str, worktree_path: Path, plan: IssueWorkPlan) -> JobRecord:
+def _record_for(
+    issue: Issue,
+    branch: str,
+    worktree_path: Path,
+    plan: IssueWorkPlan,
+    pr_url: str | None = None,
+) -> JobRecord:
     return JobRecord(
         issue_number=issue.number,
         issue_title=issue.title,
@@ -160,11 +182,71 @@ def _record_for(issue: Issue, branch: str, worktree_path: Path, plan: IssueWorkP
         stack_depth=plan.stack_depth,
         blocker_issue_numbers=list(plan.blocker_issue_numbers or []),
         finished_at=None,
-        pr_url=None,
+        pr_url=pr_url,
         error_summary=None,
         changed_files=[],
         verifier_passed=None,
     )
+
+
+def _parse_iso_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.removesuffix("Z"))
+    except ValueError:
+        return None
+
+
+def _resume_cutoff(record: JobRecord) -> datetime | None:
+    return _parse_iso_timestamp(record.finished_at) or _parse_iso_timestamp(record.started_at)
+
+
+def _is_newer_comment(comment: DiscussionComment, cutoff: datetime | None) -> bool:
+    if cutoff is None:
+        return True
+    created = _parse_iso_timestamp(comment.created_at)
+    return created is None or created > cutoff
+
+
+def _is_worker_comment(comment: DiscussionComment) -> bool:
+    body = comment.body.strip()
+    return any(body.startswith(prefix) for prefix in WORKER_COMMENT_PREFIXES)
+
+
+def _render_follow_up_comment(comment: DiscussionComment) -> str:
+    meta_parts = [comment.source]
+    if comment.author:
+        meta_parts.append(f"by {comment.author}")
+    if comment.created_at:
+        meta_parts.append(f"at {comment.created_at}")
+    meta = ", ".join(meta_parts)
+    body = comment.body.strip()
+    if comment.url:
+        meta = f"{meta} ({comment.url})"
+    return f"### {meta}\n\n{body}"
+
+
+def _build_follow_up(pr_url: str, manual_note: str, comments: list[DiscussionComment]) -> str:
+    sections = [f"Continue work on the existing pull request for this issue: {pr_url}"]
+    if manual_note.strip():
+        sections.append(f"### Local operator note\n\n{manual_note.strip()}")
+
+    rendered_comments = [_render_follow_up_comment(comment) for comment in comments if comment.body.strip()]
+    if rendered_comments:
+        kept: list[str] = []
+        total = 0
+        for section in reversed(rendered_comments):
+            if total and total + len(section) > MAX_FOLLOW_UP_CHARS:
+                break
+            kept.append(section)
+            total += len(section)
+        kept.reverse()
+        if len(kept) != len(rendered_comments):
+            sections.append("New GitHub discussion since the last worker run is truncated to the newest entries.")
+        sections.append("## New GitHub discussion since the last worker run\n\n" + "\n\n".join(kept))
+
+    return "\n\n".join(section for section in sections if section.strip()).strip()
 
 
 def _open_blockers(gh: IssueDependencyClient, issue: Issue) -> list[Issue]:
@@ -182,6 +264,48 @@ def _latest_pr_job(paths: dict[str, Path], issue_number: int) -> JobRecord | Non
     if record.status != "pr_opened" or not record.pr_url:
         return None
     return record
+
+
+def _latest_resume_job(paths: dict[str, Path], issue_number: int) -> JobRecord | None:
+    latest = issue_run_dir(paths["run_root"], issue_number) / "latest.json"
+    if not latest.exists():
+        return None
+    try:
+        record = load_job_record(latest)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not record.branch_name or not record.pr_url:
+        return None
+    return record
+
+
+def _resume_discussion(
+    gh: GHClient,
+    issue_number: int,
+    previous_record: JobRecord,
+    manual_note: str = "",
+) -> str:
+    cutoff = _resume_cutoff(previous_record)
+    comments = [
+        *gh.issue_comments(issue_number),
+        *gh.pr_comments(previous_record.pr_url or ""),
+        *gh.pr_reviews(previous_record.pr_url or ""),
+    ]
+    fresh = [
+        comment
+        for comment in comments
+        if not _is_worker_comment(comment) and _is_newer_comment(comment, cutoff)
+    ]
+    fresh.sort(key=lambda comment: comment.created_at or "")
+    return _build_follow_up(previous_record.pr_url or "", manual_note, fresh)
+
+
+def _failure_status(failure_kind: str) -> str:
+    if failure_kind == "agent":
+        return "agent_failed"
+    if failure_kind == "review":
+        return "review_failed"
+    return "verify_failed"
 
 
 def _work_plan_for_issue(
@@ -210,6 +334,34 @@ def _work_plan_for_issue(
     return IssueWorkPlan(issue, blocker_job.branch_name, stack_depth, [blocker.number])
 
 
+def _resume_plan_for_issue(
+    issue: Issue,
+    config: IssueSelectionConfig,
+    base_branch: str,
+    paths: dict[str, Path],
+) -> IssueWorkPlan | None:
+    labels = set(issue.labels)
+    blocked = {config.working_label, config.failed_label, *config.blocked_labels}
+    if (
+        issue.state.lower() != "open"
+        or config.resume_label not in labels
+        or config.pr_opened_label not in labels
+        or (labels & blocked)
+    ):
+        return None
+    record = _latest_resume_job(paths, issue.number)
+    if record is None:
+        return None
+    return IssueWorkPlan(
+        issue=issue,
+        base_branch=record.base_branch or base_branch,
+        stack_depth=record.stack_depth,
+        blocker_issue_numbers=record.blocker_issue_numbers,
+        mode="resume",
+        resume_record=record,
+    )
+
+
 def workable_issue_plans(
     gh: IssueDependencyClient,
     issues: list[Issue],
@@ -220,7 +372,9 @@ def workable_issue_plans(
     candidates = candidate_issues(issues, config)
     plans: list[IssueWorkPlan] = []
     for issue in candidates:
-        plan = _work_plan_for_issue(gh, issue, config, base_branch, paths)
+        plan = _resume_plan_for_issue(issue, config, base_branch, paths)
+        if plan is None:
+            plan = _work_plan_for_issue(gh, issue, config, base_branch, paths)
         if plan is not None:
             plans.append(plan)
     return plans
@@ -433,8 +587,9 @@ def _run_agent_and_verify(
     worktree_path: Path,
     run_dir: Path,
     stamp: str,
+    follow_up: str = "",
 ) -> tuple[bool, VerifyResult | None, DiffSummary, str, str]:
-    prompt_text = build_prompt(issue, config, repo_root)
+    prompt_text = build_prompt(issue, config, repo_root, follow_up=follow_up)
     prompt_path = run_dir / f"prompt-{stamp}.md"
     write_text_artifact(prompt_path, run_dir / "prompt.md", prompt_text)
 
@@ -451,6 +606,38 @@ def _run_agent_and_verify(
         return ok, verify, diff, error, failure_kind
 
     return _run_review_loop(config, issue, repo_root, worktree_path, run_dir, stamp, verify, diff)
+
+
+def _finalize_pr_success(
+    gh: GHClient,
+    config: WorkerConfig,
+    issue: Issue,
+    run_dir: Path,
+    record: JobRecord,
+    pr_url: str,
+    success_message: str,
+    remove_ready_label: bool,
+) -> None:
+    record.pr_url = pr_url
+    try:
+        gh.add_label(issue.number, config.issue_selection.pr_opened_label)
+        gh.remove_label(issue.number, config.issue_selection.working_label)
+        try:
+            gh.remove_label(issue.number, config.issue_selection.resume_label)
+        except GHError:
+            pass
+        try:
+            gh.remove_label(issue.number, config.issue_selection.failed_label)
+        except GHError:
+            pass
+        if remove_ready_label and config.git.remove_ready_on_pr:
+            gh.remove_label(issue.number, config.issue_selection.ready_label)
+        comment = run_dir / "success-comment.md"
+        write_single_artifact(comment, f"{success_message}: {pr_url}\n")
+        gh.comment(issue.number, comment)
+    except GHError:
+        pass
+    _write_record(run_dir, record, "pr_opened", None)
 
 
 def process_issue(config: WorkerConfig, plan: IssueWorkPlan, repo_root: Path, paths: dict[str, Path]) -> int:
@@ -479,12 +666,7 @@ def process_issue(config: WorkerConfig, plan: IssueWorkPlan, repo_root: Path, pa
     record.changed_files = diff.changed_files
     record.verifier_passed = verify.passed if verify else None
     if not ok:
-        if failure_kind == "agent":
-            status = "agent_failed"
-        elif failure_kind == "review":
-            status = "review_failed"
-        else:
-            status = "verify_failed"
+        status = _failure_status(failure_kind)
         _finalize_issue_failure(gh, config, issue, run_dir, error, add_failed_label=True)
         _write_record(run_dir, record, status, error)
         return EXIT_AGENT if failure_kind == "agent" else EXIT_VERIFY
@@ -522,19 +704,183 @@ def process_issue(config: WorkerConfig, plan: IssueWorkPlan, repo_root: Path, pa
         _write_record(run_dir, record, "failed", str(exc))
         return EXIT_PR
 
-    record.pr_url = pr_url
+    _finalize_pr_success(
+        gh,
+        config,
+        issue,
+        run_dir,
+        record,
+        pr_url,
+        success_message="Draft PR opened",
+        remove_ready_label=True,
+    )
+    if not config.git.keep_worktree_on_success:
+        try:
+            remove_worktree(worktree_path)
+        except GitError:
+            pass
+    return EXIT_OK
+
+
+def resume_issue(
+    config_path: Path,
+    issue_number: int,
+    manual_note: str = "",
+    repo_root: Path | None = None,
+    overrides: RunOverrides | None = None,
+) -> int:
+    root = repo_root or Path.cwd()
     try:
-        gh.add_label(issue.number, config.issue_selection.pr_opened_label)
-        gh.remove_label(issue.number, config.issue_selection.working_label)
-        if config.git.remove_ready_on_pr:
-            gh.remove_label(issue.number, config.issue_selection.ready_label)
-        comment = run_dir / "success-comment.md"
-        write_single_artifact(comment, f"Draft PR opened: {pr_url}\n")
-        gh.comment(issue.number, comment)
+        config = apply_overrides(load_config(config_path), overrides)
+    except ConfigError as exc:
+        print(f"configuration error: {exc}")
+        return EXIT_CONFIG
+    paths = configured_paths(config, root)
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with FileLock(paths["runtime_root"] / "worker.lock"):
+            try:
+                check_dependencies(config, root=root, paths=paths)
+            except DependencyError as exc:
+                print(f"dependency error: {exc}")
+                return EXIT_DEPENDENCY
+            except GHError as exc:
+                print(f"GitHub error: {exc}")
+                return EXIT_GH
+            except GitError as exc:
+                print(f"git error: {exc}")
+                return EXIT_GIT
+
+            gh = GHClient(config.repo)
+            previous_record = _latest_resume_job(paths, issue_number)
+            if previous_record is None or not previous_record.pr_url:
+                print(
+                    f"resume error: issue #{issue_number} does not have a recorded open PR in local worker state"
+                )
+                return EXIT_CONFIG
+            try:
+                issue = gh.view_issue(issue_number)
+                return process_issue_resume(config, issue, previous_record, root, paths, manual_note)
+            except GHError as exc:
+                print(f"GitHub error: {exc}")
+                return EXIT_GH
+    except LockHeld:
+        print("lock already held")
+        return EXIT_LOCK
+
+
+def process_issue_resume(
+    config: WorkerConfig,
+    issue: Issue,
+    previous_record: JobRecord,
+    repo_root: Path,
+    paths: dict[str, Path],
+    manual_note: str = "",
+) -> int:
+    gh = GHClient(config.repo)
+    stamp = utc_timestamp()
+    pr_url = previous_record.pr_url
+    assert pr_url is not None
+    branch = previous_record.branch_name
+    worktree_path = Path(previous_record.worktree_path)
+    run_dir = issue_run_dir(paths["run_root"], issue.number)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    record = _record_for(
+        issue,
+        branch,
+        worktree_path,
+        IssueWorkPlan(
+            issue=issue,
+            base_branch=previous_record.base_branch or config.base_branch,
+            stack_depth=previous_record.stack_depth,
+            blocker_issue_numbers=previous_record.blocker_issue_numbers,
+        ),
+        pr_url=pr_url,
+    )
+    write_job_record(run_dir, record, stamp)
+
+    follow_up = _resume_discussion(gh, issue.number, previous_record, manual_note)
+
+    try:
+        gh.add_label(issue.number, config.issue_selection.working_label)
+        try:
+            gh.remove_label(issue.number, config.issue_selection.failed_label)
+        except GHError:
+            pass
+        record.status = "working"
+        write_job_record(run_dir, record, stamp)
     except GHError:
         pass
 
-    _write_record(run_dir, record, "pr_opened", None)
+    try:
+        ensure_worktree(worktree_path, branch)
+    except GitError as exc:
+        _finalize_issue_failure(gh, config, issue, run_dir, f"Git worktree setup failed:\n\n{exc}", add_failed_label=False)
+        _write_record(run_dir, record, "failed", str(exc))
+        return EXIT_GIT
+
+    ok, verify, diff, error, failure_kind = _run_agent_and_verify(
+        config,
+        issue,
+        repo_root,
+        worktree_path,
+        run_dir,
+        stamp,
+        follow_up=follow_up,
+    )
+    record.changed_files = diff.changed_files
+    record.verifier_passed = verify.passed if verify else None
+    if not ok:
+        status = _failure_status(failure_kind)
+        _finalize_issue_failure(gh, config, issue, run_dir, error, add_failed_label=True)
+        _write_record(run_dir, record, status, error)
+        return EXIT_AGENT if failure_kind == "agent" else EXIT_VERIFY
+
+    if diff.rejected:
+        status = "no_changes" if diff.rejection_reason == "no changes" else "diff_rejected"
+        message = f"Diff policy rejected the result:\n\n{diff.rejection_reason}"
+        _finalize_issue_failure(gh, config, issue, run_dir, message, add_failed_label=True)
+        _write_record(run_dir, record, status, diff.rejection_reason)
+        return EXIT_VERIFY
+
+    try:
+        commit_message = render_template(config.git.commit_message_template, issue)
+        commit_all(worktree_path, commit_message)
+        record.status = "committed"
+        write_job_record(run_dir, record, stamp)
+        push_branch(worktree_path, branch)
+        record.status = "pushed"
+        write_job_record(run_dir, record, stamp)
+    except GitError as exc:
+        _finalize_issue_failure(gh, config, issue, run_dir, f"Git commit/push failed:\n\n{exc}", add_failed_label=False)
+        _write_record(run_dir, record, "failed", str(exc))
+        return EXIT_GIT
+
+    assert verify is not None
+    verification_summary = format_verification_summary(verify)
+    pr_body = build_pr_body(config.pr, issue, verification_summary, diff)
+    pr_body_path = run_dir / f"pr-body-{stamp}.md"
+    write_text_artifact(pr_body_path, run_dir / "pr_body.md", pr_body)
+    try:
+        pr_title = render_template(config.pr.title_template, issue)
+        gh.update_pr(pr_url, pr_title, pr_body_path)
+    except GHError as exc:
+        _finalize_issue_failure(gh, config, issue, run_dir, f"PR update failed:\n\n{exc}", add_failed_label=False)
+        _write_record(run_dir, record, "failed", str(exc))
+        return EXIT_PR
+
+    _finalize_pr_success(
+        gh,
+        config,
+        issue,
+        run_dir,
+        record,
+        pr_url,
+        success_message="Updated PR",
+        remove_ready_label=False,
+    )
     if not config.git.keep_worktree_on_success:
         try:
             remove_worktree(worktree_path)
@@ -570,7 +916,7 @@ def run_once(config_path: Path, repo_root: Path | None = None, overrides: RunOve
 
             gh = GHClient(config.repo)
             try:
-                issues = gh.list_issues(config.issue_selection.ready_label)
+                issues = gh.list_issues([config.issue_selection.ready_label, config.issue_selection.resume_label])
                 plan = select_work_plan(gh, issues, config.issue_selection, config.base_branch, paths)
                 if plan is None:
                     return EXIT_OK
@@ -580,7 +926,12 @@ def run_once(config_path: Path, repo_root: Path | None = None, overrides: RunOve
                     base_branch=plan.base_branch,
                     stack_depth=plan.stack_depth,
                     blocker_issue_numbers=plan.blocker_issue_numbers,
+                    mode=plan.mode,
+                    resume_record=plan.resume_record,
                 )
+                if plan.mode == "resume":
+                    assert plan.resume_record is not None
+                    return process_issue_resume(config, issue, plan.resume_record, root, paths)
                 return process_issue(config, plan, root, paths)
             except GHError as exc:
                 print(f"GitHub error: {exc}")

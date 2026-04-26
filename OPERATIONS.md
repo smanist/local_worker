@@ -47,6 +47,18 @@ Retry a failed issue:
 ai-issue retry <issue-number>
 ```
 
+Resume an existing ai-issue PR with follow-up instructions:
+
+```bash
+ai-issue resume <issue-number> --comment "Address the latest review feedback."
+```
+
+Queue an existing ai-issue PR for the normal scheduler to pick up later:
+
+```bash
+ai-issue resume <issue-number> --queue --comment "Address the latest review feedback."
+```
+
 Clean old run directories and worktrees:
 
 ```bash
@@ -97,6 +109,8 @@ For daemon state:
 - Stacked PRs are only considered when dependency checking is enabled, there is exactly one open blocker, and that blocker already has a recorded `pr_opened` job.
 - `clean --delete-local-branches` deletes local branches with `git branch -D`; use it deliberately.
 - `keep_worktree_on_failure` and `keep_worktree_on_success` change how much state remains available for inspection after runs.
+- `resume` without `--queue` bypasses normal `ai-ready` selection. It reuses the recorded branch/worktree for an existing PR, pulls in new issue comments plus PR comments/reviews since the last run, and updates the existing PR body after verification.
+- `resume --queue` posts the optional note as an issue comment, adds the `ai-resume` label, and lets the normal `run-once` / `start` loop pick that PR revision up later.
 
 ## Test Workflow
 

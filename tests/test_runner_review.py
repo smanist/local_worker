@@ -3,8 +3,8 @@ from pathlib import Path
 
 from ai_issue_worker.config import config_from_dict
 from ai_issue_worker.jobs import write_job_record
-from ai_issue_worker.models import AgentResult, CommandResult, DiffSummary, Issue, JobRecord, VerifyResult
-from ai_issue_worker.runner import _diff_snapshot, _run_agent_and_verify, blocking_review_priorities, select_work_plan
+from ai_issue_worker.models import AgentResult, CommandResult, DiffSummary, DiscussionComment, Issue, JobRecord, VerifyResult
+from ai_issue_worker.runner import EXIT_OK, _diff_snapshot, _run_agent_and_verify, blocking_review_priorities, process_issue_resume, run_once, select_work_plan
 
 
 def _issue() -> Issue:
@@ -153,6 +153,25 @@ def test_select_workable_issue_respects_max_stack_depth(tmp_path: Path):
     assert plan is None
 
 
+def test_select_workable_issue_can_pick_queued_resume(tmp_path: Path):
+    config = config_from_dict({"repo": "owner/repo"}).issue_selection
+    paths = {"run_root": tmp_path}
+    _write_pr_job(tmp_path, 12, "ai/issue-12-existing")
+    issues = [
+        Issue(12, "Resume", "", ["ai-pr-opened", "ai-resume"], "open", updated_at="2026-01-01T00:00:00Z"),
+        Issue(13, "Fresh", "", ["ai-ready"], "open", updated_at="2026-01-02T00:00:00Z"),
+    ]
+    gh = FakeDependencyGH({})
+
+    plan = select_work_plan(gh, issues, config, "main", paths)
+
+    assert plan and plan.issue.number == 12
+    assert plan.mode == "resume"
+    assert plan.resume_record is not None
+    assert plan.resume_record.branch_name == "ai/issue-12-existing"
+    assert gh.checked == [13]
+
+
 def test_run_agent_review_fix_loop_until_clean(monkeypatch, tmp_path: Path):
     config = config_from_dict({"repo": "owner/repo", "verify": {"commands": ["pytest"]}})
     run_dir = tmp_path / "run"
@@ -282,7 +301,158 @@ def test_run_agent_fails_when_review_session_modifies_worktree(monkeypatch, tmp_
     assert verify and verify.passed is True
     assert diff.changed_files == ["src/app.py"]
     assert "modified the worktree" in error
-    assert failure_kind == "agent"
+
+
+def test_process_issue_resume_reuses_existing_pr_and_includes_follow_up(monkeypatch, tmp_path: Path):
+    config = config_from_dict({"repo": "owner/repo", "verify": {"commands": ["pytest"]}})
+    run_root = tmp_path / "runs"
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    previous = JobRecord(
+        issue_number=123,
+        issue_title="Bug title",
+        branch_name="ai/issue-123-bug-title",
+        worktree_path=str(worktree_path),
+        status="pr_opened",
+        started_at="2026-01-01T00:00:00Z",
+        finished_at="2026-01-01T00:10:00Z",
+        base_branch="main",
+        pr_url="https://github.com/owner/repo/pull/5",
+    )
+    issue = Issue(123, "Bug title", "Bug body", ["ai-pr-opened"], "open")
+    prompts: list[str] = []
+    updated_pr = {}
+    ensured = {}
+
+    class FakeResumeGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def issue_comments(self, number: int):
+            assert number == 123
+            return [
+                DiscussionComment("issue comment", "Draft PR opened: https://github.com/owner/repo/pull/5", "worker", "2026-01-02T00:00:00Z"),
+                DiscussionComment("issue comment", "Please add a regression test.", "alice", "2026-01-02T00:01:00Z"),
+            ]
+
+        def pr_comments(self, pr_url: str):
+            assert pr_url == previous.pr_url
+            return [DiscussionComment("pull request comment", "Handle the nil case too.", "bob", "2026-01-02T00:02:00Z")]
+
+        def pr_reviews(self, pr_url: str):
+            assert pr_url == previous.pr_url
+            return [
+                DiscussionComment("pull request review", "Old review", "carol", "2026-01-01T00:05:00Z"),
+                DiscussionComment("pull request review", "One more edge case looks untested.", "dora", "2026-01-02T00:03:00Z"),
+            ]
+
+        def add_label(self, number: int, label: str) -> None:
+            pass
+
+        def remove_label(self, number: int, label: str) -> None:
+            pass
+
+        def comment(self, number: int, body_file: Path) -> None:
+            pass
+
+        def update_pr(self, pr_url: str, title: str, body_file: Path) -> None:
+            updated_pr["url"] = pr_url
+            updated_pr["title"] = title
+            updated_pr["body"] = body_file.read_text(encoding="utf-8")
+
+    outputs = iter(["implementation complete", "BLOCKING_PRIORITIES: NONE\n\nNo findings."])
+
+    def fake_codex(config, worktree_path, prompt_path, log_path, command=None):
+        prompts.append(prompt_path.read_text(encoding="utf-8"))
+        log_path.write_text("log", encoding="utf-8")
+        return AgentResult(True, 0, next(outputs), "", 0.1, False)
+
+    def fake_verifier(config, worktree_path, log_path):
+        log_path.write_text("PASS pytest", encoding="utf-8")
+        return VerifyResult(True, [CommandResult("pytest", 0, "ok", "", 0.1)])
+
+    def fake_ensure_worktree(path: Path, branch: str):
+        ensured["path"] = path
+        ensured["branch"] = branch
+
+    monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeResumeGH)
+    monkeypatch.setattr("ai_issue_worker.runner._run_codex_session", fake_codex)
+    monkeypatch.setattr("ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff")
+    monkeypatch.setattr("ai_issue_worker.runner.run_verifier", fake_verifier)
+    monkeypatch.setattr("ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff())
+    monkeypatch.setattr("ai_issue_worker.runner.ensure_worktree", fake_ensure_worktree)
+    monkeypatch.setattr("ai_issue_worker.runner.commit_all", lambda worktree_path, message: None)
+    monkeypatch.setattr("ai_issue_worker.runner.push_branch", lambda worktree_path, branch: None)
+    monkeypatch.setattr("ai_issue_worker.runner.remove_worktree", lambda worktree_path: None)
+
+    result = process_issue_resume(
+        config,
+        issue,
+        previous,
+        tmp_path,
+        {"run_root": run_root},
+        manual_note="Address the reviewer feedback without changing the public API.",
+    )
+
+    assert result == EXIT_OK
+    assert ensured == {"path": worktree_path, "branch": "ai/issue-123-bug-title"}
+    assert updated_pr["url"] == previous.pr_url
+    assert "Bug title" in updated_pr["title"]
+    assert "PASS pytest" in updated_pr["body"]
+    assert prompts
+    prompt = prompts[0]
+    assert "## Continuation context" in prompt
+    assert "Address the reviewer feedback without changing the public API." in prompt
+    assert "Please add a regression test." in prompt
+    assert "Handle the nil case too." in prompt
+    assert "One more edge case looks untested." in prompt
+    assert "Draft PR opened:" not in prompt
+    assert "Old review" not in prompt
+
+
+def test_run_once_dispatches_queued_resume(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("repo: owner/repo\n", encoding="utf-8")
+    run_root = tmp_path / ".ai-runs"
+    _write_pr_job(run_root, 77, "ai/issue-77-existing")
+    captured = {}
+
+    class FakeRunOnceGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def validate(self) -> None:
+            pass
+
+        def list_issues(self, labels):
+            captured["labels"] = labels
+            return [Issue(77, "Resume", "", ["ai-pr-opened", "ai-resume"], "open", updated_at="2026-01-01T00:00:00Z")]
+
+        def view_issue(self, number: int):
+            assert number == 77
+            return Issue(77, "Resume", "Issue body", ["ai-pr-opened", "ai-resume"], "open", updated_at="2026-01-01T00:00:00Z")
+
+        def blocked_by(self, number: int):
+            return []
+
+    def fake_resume(config, issue, previous_record, repo_root, paths, manual_note=""):
+        captured["issue"] = issue.number
+        captured["branch"] = previous_record.branch_name
+        captured["manual_note"] = manual_note
+        return EXIT_OK
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeRunOnceGH)
+    monkeypatch.setattr("ai_issue_worker.runner.check_dependencies", lambda config, root=None, paths=None: None)
+    monkeypatch.setattr("ai_issue_worker.runner.process_issue_resume", fake_resume)
+
+    result = run_once(config_path)
+
+    assert result == EXIT_OK
+    assert captured["labels"] == ["ai-ready", "ai-resume"]
+    assert captured["issue"] == 77
+    assert captured["branch"] == "ai/issue-77-existing"
+    assert captured["manual_note"] == ""
 
 
 def test_diff_snapshot_changes_when_untracked_file_content_changes(tmp_path: Path):

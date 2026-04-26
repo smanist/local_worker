@@ -21,7 +21,7 @@ from .github_gh import GHClient, GHError
 from .jobs import issue_run_dir, recent_jobs
 from .locking import lock_status
 from .prompt import build_issue_draft_prompt
-from .runner import RunOverrides, configured_paths, run_once, workable_issues
+from .runner import RunOverrides, configured_paths, resume_issue, run_once, workable_issues
 from .shell import run_cmd
 from .worktree import GitError, remove_worktree
 
@@ -125,6 +125,7 @@ def _automation_label_specs(config) -> dict[str, tuple[str, str]]:
 
     labels = config.issue_selection
     add(labels.ready_label, "0E8A16", "Ready for the local AI issue worker to process.")
+    add(labels.resume_label, "FB8C00", "Queue a follow-up pass on an existing AI issue worker pull request.")
     add(labels.working_label, "1D76DB", "Currently being processed by the local AI issue worker.")
     add(labels.failed_label, "D73A4A", "The local AI issue worker failed to complete this issue.")
     add(labels.pr_opened_label, "5319E7", "The local AI issue worker opened a pull request for this issue.")
@@ -236,6 +237,18 @@ def _read_description(args) -> str:
     return ""
 
 
+def _read_resume_comment(args) -> str:
+    if args.comment_file:
+        if args.comment_file == "-":
+            return sys.stdin.read()
+        return Path(args.comment_file).read_text(encoding="utf-8")
+    if args.comment:
+        return args.comment
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    return ""
+
+
 def _editor_command(editor: str | None = None) -> list[str]:
     for command in [editor, os.environ.get("VISUAL"), os.environ.get("EDITOR")]:
         if command:
@@ -310,7 +323,7 @@ def cmd_list(args) -> int:
     try:
         config = _load(args.config)
         gh = GHClient(config.repo)
-        issues = gh.list_issues(config.issue_selection.ready_label)
+        issues = gh.list_issues([config.issue_selection.ready_label, config.issue_selection.resume_label])
         candidates = workable_issues(
             gh,
             issues,
@@ -546,6 +559,37 @@ def cmd_retry(args) -> int:
     return 0
 
 
+def cmd_resume(args) -> int:
+    if args.queue:
+        try:
+            config = _load(args.config)
+            gh = GHClient(config.repo)
+            comment = _read_resume_comment(args).strip()
+            if comment:
+                run_dir = issue_run_dir(_paths(config, Path.cwd())["run_root"], args.issue)
+                comment_file = run_dir / "queued-resume-comment.md"
+                comment_file.parent.mkdir(parents=True, exist_ok=True)
+                comment_file.write_text(comment + "\n", encoding="utf-8")
+                gh.comment(args.issue, comment_file)
+            try:
+                gh.remove_label(args.issue, config.issue_selection.failed_label)
+            except GHError:
+                pass
+            gh.add_label(args.issue, config.issue_selection.resume_label)
+        except (ConfigError, GHError) as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        print(f"issue #{args.issue} queued for resume")
+        return 0
+    comment = _read_resume_comment(args).strip()
+    return resume_issue(
+        Path(args.config),
+        args.issue,
+        manual_note=comment,
+        overrides=RunOverrides(model=args.model, reasoning=args.reasoning),
+    )
+
+
 def cmd_clean(args) -> int:
     try:
         config = _load(args.config)
@@ -646,6 +690,16 @@ def build_parser() -> argparse.ArgumentParser:
     retry.add_argument("--model")
     retry.add_argument("--reasoning", choices=REASONING_EFFORTS)
     retry.set_defaults(func=cmd_retry)
+
+    resume = sub.add_parser("resume")
+    resume.add_argument("issue", type=int)
+    resume.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+    resume.add_argument("--queue", action="store_true")
+    resume.add_argument("--comment")
+    resume.add_argument("--comment-file")
+    resume.add_argument("--model")
+    resume.add_argument("--reasoning", choices=REASONING_EFFORTS)
+    resume.set_defaults(func=cmd_resume)
 
     clean = sub.add_parser("clean")
     clean.add_argument("--config", default=DEFAULT_CONFIG_PATH)

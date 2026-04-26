@@ -30,6 +30,28 @@ class Issue:
 
 
 @dataclass
+class DiscussionComment:
+    source: str
+    body: str
+    author: str | None = None
+    created_at: str | None = None
+    url: str | None = None
+
+    @classmethod
+    def from_gh(cls, data: dict[str, Any], source: str) -> "DiscussionComment":
+        user = data.get("user") or {}
+        created_at = data.get("created_at") or data.get("submitted_at")
+        url = data.get("html_url") or data.get("url")
+        return cls(
+            source=source,
+            body=data.get("body") or "",
+            author=user.get("login") if isinstance(user, dict) else None,
+            created_at=created_at,
+            url=url,
+        )
+
+
+@dataclass
 class JobRecord:
     issue_number: int
     issue_title: str

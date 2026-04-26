@@ -21,12 +21,19 @@ pytest
 ai-issue init
 ```
 
-Edit `.ai-issue-worker.yaml`, especially:
+`init` writes `.ai-issue-worker.yaml`, inferring the GitHub repo from
+`origin` and the base branch from `origin/HEAD` or the current branch when
+possible:
 
 ```yaml
 repo: owner/repo
 base_branch: main
 ```
+
+It also creates or updates the GitHub labels used by the automation, including
+`ai-ready`, `ai-working`, `ai-failed`, and `ai-pr-opened`, when `gh` is
+authenticated for the inferred repo. Use `--repo`, `--base-branch`, or
+`--no-create-labels` to override those defaults.
 
 List candidate issues:
 

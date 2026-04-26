@@ -12,6 +12,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .config import DEFAULT_CONFIG_PATH, REASONING_EFFORTS, ConfigError, load_config, write_default_config
 from .codex_backend import CodexBackend
@@ -59,6 +60,74 @@ def _paths(config, root: Path):
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
     return paths
+
+
+def _repo_from_remote_url(url: str) -> str | None:
+    raw = url.strip()
+    if not raw:
+        return None
+    if raw.endswith(".git"):
+        raw = raw[:-4]
+    if "://" not in raw and ":" in raw and "@" in raw:
+        host, path = raw.split("@", 1)[1].split(":", 1)
+        parts = [part for part in path.split("/") if part]
+    else:
+        parsed = urlparse(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        host = parsed.hostname or parsed.netloc
+        parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 2:
+        return None
+    owner, repo = parts[-2], parts[-1]
+    if not owner or not repo:
+        return None
+    if host in {"github.com", "www.github.com"}:
+        return f"{owner}/{repo}"
+    return f"{host}/{owner}/{repo}"
+
+
+def _git_stdout(args: list[str]) -> str | None:
+    result = run_cmd(args)
+    if result.exit_code != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def _infer_repo_from_git() -> str | None:
+    remote_url = _git_stdout(["git", "remote", "get-url", "origin"])
+    if not remote_url:
+        return None
+    return _repo_from_remote_url(remote_url)
+
+
+def _infer_base_branch_from_git() -> str | None:
+    origin_head = _git_stdout(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+    if origin_head:
+        return origin_head.removeprefix("origin/")
+    current = _git_stdout(["git", "branch", "--show-current"])
+    if current:
+        return current
+    default_branch = _git_stdout(["git", "config", "--get", "init.defaultBranch"])
+    return default_branch
+
+
+def _automation_label_specs(config) -> dict[str, tuple[str, str]]:
+    specs: dict[str, tuple[str, str]] = {}
+
+    def add(name: str, color: str, description: str) -> None:
+        if name and name not in specs:
+            specs[name] = (color, description)
+
+    labels = config.issue_selection
+    add(labels.ready_label, "0E8A16", "Ready for the local AI issue worker to process.")
+    add(labels.working_label, "1D76DB", "Currently being processed by the local AI issue worker.")
+    add(labels.failed_label, "D73A4A", "The local AI issue worker failed to complete this issue.")
+    add(labels.pr_opened_label, "5319E7", "The local AI issue worker opened a pull request for this issue.")
+    for label in labels.blocked_labels:
+        add(label, "FBCA04", "Blocked from local AI issue worker selection until human action is taken.")
+    return specs
 
 
 def _first_nonempty_line(text: str) -> str:
@@ -192,12 +261,27 @@ def _generate_issue_draft(config, repo_root: Path, description: str, title_hint:
 
 
 def cmd_init(args) -> int:
+    repo = args.repo or _infer_repo_from_git() or "owner/repo"
+    base_branch = args.base_branch or _infer_base_branch_from_git() or "main"
+    path = Path(args.path)
     try:
-        write_default_config(Path(args.path), force=args.force)
+        write_default_config(path, force=args.force, repo=repo, base_branch=base_branch)
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 1
     print(f"created {args.path}")
+    if repo == "owner/repo":
+        print("repo could not be inferred; edit repo in the config before running the worker", file=sys.stderr)
+        return 0
+    if args.no_create_labels:
+        return 0
+    try:
+        config = load_config(path)
+        GHClient(config.repo).ensure_labels(_automation_label_specs(config))
+    except (ConfigError, GHError) as exc:
+        print(f"warning: could not create GitHub labels: {exc}", file=sys.stderr)
+        return 0
+    print("created or updated GitHub labels")
     return 0
 
 
@@ -480,6 +564,9 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init")
     init.add_argument("--path", default=DEFAULT_CONFIG_PATH)
     init.add_argument("--force", action="store_true")
+    init.add_argument("--repo", help="GitHub repository in owner/repo or host/owner/repo form")
+    init.add_argument("--base-branch", help="base branch for worker pull requests")
+    init.add_argument("--no-create-labels", action="store_true", help="skip creating worker labels on GitHub")
     init.set_defaults(func=cmd_init)
 
     run = sub.add_parser("run-once")

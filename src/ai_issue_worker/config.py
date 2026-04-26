@@ -128,10 +128,10 @@ def _merge(default: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def default_config_dict(repo: str = "owner/repo") -> dict[str, Any]:
+def default_config_dict(repo: str = "owner/repo", base_branch: str = "main") -> dict[str, Any]:
     return {
         "repo": repo,
-        "base_branch": "main",
+        "base_branch": base_branch,
         "paths": PathsConfig().__dict__,
         "scheduler": SchedulerConfig().__dict__,
         "issue_selection": IssueSelectionConfig().__dict__,
@@ -190,18 +190,21 @@ def load_config(path: Path) -> WorkerConfig:
     return config_from_dict(data)
 
 
-def default_config_text() -> str:
-    data = default_config_dict()
+def default_config_text(repo: str = "owner/repo", base_branch: str = "main") -> str:
+    data = default_config_dict(repo=repo, base_branch=base_branch)
     body = yaml.safe_dump(data, sort_keys=False)
+    repo_comment = "# Repo and base_branch were inferred from local git when possible.\n"
+    if repo == "owner/repo":
+        repo_comment = "# Replace repo with the target GitHub repository in owner/repo form.\n"
     return (
         "# Local AI Issue Worker configuration\n"
-        "# Replace repo with the target GitHub repository in owner/repo form.\n"
+        f"{repo_comment}"
         "# Verifier commands run inside the issue worktree and are trusted local config.\n"
         f"{body}"
     )
 
 
-def write_default_config(path: Path, force: bool = False) -> None:
+def write_default_config(path: Path, force: bool = False, repo: str = "owner/repo", base_branch: str = "main") -> None:
     if path.exists() and not force:
         raise ConfigError(f"config already exists: {path}; use --force to overwrite")
-    path.write_text(default_config_text(), encoding="utf-8")
+    path.write_text(default_config_text(repo=repo, base_branch=base_branch), encoding="utf-8")

@@ -1,7 +1,8 @@
 from pathlib import Path
 
 from ai_issue_worker import cli
-from ai_issue_worker.models import Issue
+from ai_issue_worker.config import load_config
+from ai_issue_worker.models import CommandResult, Issue
 
 
 class FakeGH:
@@ -17,8 +18,44 @@ class FakeGH:
 
 def test_cli_init_smoke(tmp_path: Path):
     path = tmp_path / "config.yaml"
-    assert cli.main(["init", "--path", str(path)]) == 0
+    assert cli.main(["init", "--path", str(path), "--no-create-labels"]) == 0
     assert path.exists()
+
+
+def test_cli_init_infers_repo_and_branch_and_creates_labels(tmp_path: Path, monkeypatch):
+    path = tmp_path / "config.yaml"
+    captured = {}
+
+    def fake_run_cmd(args):
+        if args == ["git", "remote", "get-url", "origin"]:
+            return CommandResult("git remote get-url origin", 0, "git@github.com:acme/widget.git\n", "", 0.0)
+        if args == ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"]:
+            return CommandResult("git symbolic-ref --short refs/remotes/origin/HEAD", 0, "origin/trunk\n", "", 0.0)
+        raise AssertionError(f"unexpected command: {args}")
+
+    class FakeInitGH:
+        def __init__(self, repo: str):
+            captured["repo"] = repo
+
+        def ensure_labels(self, labels):
+            captured["labels"] = labels
+
+    monkeypatch.setattr(cli, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(cli, "GHClient", FakeInitGH)
+
+    assert cli.main(["init", "--path", str(path)]) == 0
+
+    config = load_config(path)
+    assert config.repo == "acme/widget"
+    assert config.base_branch == "trunk"
+    assert captured["repo"] == "acme/widget"
+    assert set(captured["labels"]) >= {"ai-ready", "ai-working", "ai-failed", "ai-pr-opened", "blocked", "needs-human"}
+
+
+def test_repo_from_remote_url_supports_github_and_enterprise_remotes():
+    assert cli._repo_from_remote_url("https://github.com/owner/repo.git") == "owner/repo"
+    assert cli._repo_from_remote_url("git@github.com:owner/repo.git") == "owner/repo"
+    assert cli._repo_from_remote_url("ssh://git@github.example.com/owner/repo.git") == "github.example.com/owner/repo"
 
 
 def test_cli_list_smoke_with_fake_gh(tmp_path: Path, monkeypatch, capsys):

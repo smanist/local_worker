@@ -22,6 +22,14 @@ def test_default_config_generation_works(tmp_path: Path):
     assert config.review.fix_priorities == ["P0", "P1"]
 
 
+def test_default_config_can_use_inferred_repo_and_branch(tmp_path: Path):
+    path = tmp_path / ".ai-issue-worker.yaml"
+    write_default_config(path, repo="owner/repo", base_branch="trunk")
+    config = load_config(path)
+    assert config.repo == "owner/repo"
+    assert config.base_branch == "trunk"
+
+
 def test_config_missing_repo_fails_clearly():
     with pytest.raises(ConfigError, match="repo"):
         config_from_dict({"base_branch": "main"})

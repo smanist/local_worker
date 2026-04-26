@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 from .models import Issue
@@ -92,6 +93,27 @@ class GHClient:
 
     def remove_label(self, number: int, label: str) -> None:
         self._run(["gh", "issue", "edit", str(number), "--repo", self.repo, "--remove-label", label])
+
+    def ensure_label(self, name: str, color: str, description: str) -> None:
+        self._run(
+            [
+                "gh",
+                "label",
+                "create",
+                name,
+                "--repo",
+                self.repo,
+                "--color",
+                color,
+                "--description",
+                description,
+                "--force",
+            ]
+        )
+
+    def ensure_labels(self, labels: Mapping[str, tuple[str, str]]) -> None:
+        for name, (color, description) in labels.items():
+            self.ensure_label(name, color, description)
 
     def comment(self, number: int, body_file: Path) -> None:
         self._run(["gh", "issue", "comment", str(number), "--repo", self.repo, "--body-file", str(body_file)])

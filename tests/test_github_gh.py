@@ -55,3 +55,49 @@ def test_blocked_by_passes_hostname_for_hosted_repo(monkeypatch):
         "github.example.com",
         "repos/owner/repo/issues/1/dependencies/blocked_by",
     ]
+
+
+def test_ensure_labels_creates_or_updates_each_label(monkeypatch):
+    captured = []
+
+    def fake_run_cmd(args):
+        captured.append(args)
+        return Result("")
+
+    monkeypatch.setattr("ai_issue_worker.github_gh.run_cmd", fake_run_cmd)
+
+    GHClient("owner/repo").ensure_labels(
+        {
+            "ai-ready": ("0E8A16", "Ready for automation."),
+            "ai-working": ("1D76DB", "Automation is working."),
+        }
+    )
+
+    assert captured == [
+        [
+            "gh",
+            "label",
+            "create",
+            "ai-ready",
+            "--repo",
+            "owner/repo",
+            "--color",
+            "0E8A16",
+            "--description",
+            "Ready for automation.",
+            "--force",
+        ],
+        [
+            "gh",
+            "label",
+            "create",
+            "ai-working",
+            "--repo",
+            "owner/repo",
+            "--color",
+            "1D76DB",
+            "--description",
+            "Automation is working.",
+            "--force",
+        ],
+    ]

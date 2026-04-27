@@ -113,7 +113,7 @@ the review is clean or `review.max_iterations` fix passes have been used.
 
 Each issue run directory also contains `artifacts.log`, a timestamped manifest of
 generated run artifacts such as prompts, Codex logs, verifier logs, review files,
-job records, PR bodies, and latest-file updates. After each Codex session, the
+job records, PR bodies, resume summaries, and latest-file updates. After each Codex session, the
 manifest records token usage when the configured Codex command exposes it in
 stdout/stderr, plus a cumulative total across Codex logs in that issue directory.
 
@@ -126,7 +126,7 @@ ai-issue logs
 ai-issue stop
 ```
 
-Resume work on an existing ai-issue PR for a specific issue. The worker reuses the recorded branch/worktree for that issue, includes new issue comments and PR review discussion since the last worker run, accepts an optional local operator note, and updates the existing PR instead of opening a new one:
+Resume work on an existing ai-issue PR for a specific issue. The worker reuses the recorded branch/worktree for that issue, includes the latest local `summary.md` artifact plus new issue comments and PR review discussion since the last worker run, accepts an optional local operator note, and updates the existing PR instead of opening a new one:
 
 ```bash
 ai-issue resume 123 --comment "Address the latest review feedback and keep the API unchanged."

@@ -31,7 +31,8 @@ The repo is intentionally small. Most behavior lives in `src/ai_issue_worker/run
 - Config is loaded from `.ai-issue-worker.yaml`.
 - Local state lives under `.ai-worktrees`, `.ai-runs`, `.ai-logs`, and `.ai-runtime`.
 - The worker uses filesystem artifacts as its audit trail. Each issue gets a run directory under `.ai-runs/issue-<n>/`.
-- `latest.json`, `prompt.md`, `verify.log`, `review.md`, `pr_body.md`, and `codex.log` are convenience pointers to the newest timestamped artifacts.
+- Successful PR open/update flows also write a local `summary.md` artifact for future resume runs.
+- `latest.json`, `prompt.md`, `verify.log`, `review.md`, `summary.md`, `pr_body.md`, and `codex.log` are convenience pointers to the newest timestamped artifacts.
 - The worker lock is `.ai-runtime/worker.lock`. Daemon status is `.ai-runtime/worker.status.json`.
 
 ## Invariants To Preserve

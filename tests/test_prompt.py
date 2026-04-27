@@ -5,6 +5,7 @@ from ai_issue_worker.models import CommandResult, DiffSummary, Issue, VerifyResu
 from ai_issue_worker.prompt import (
     build_issue_draft_prompt,
     build_prompt,
+    build_resume_summary_prompt,
     build_review_fix_prompt,
     build_review_prompt,
     repository_instructions,
@@ -66,6 +67,27 @@ def test_review_fix_prompt_targets_only_blocking_findings():
     assert "Fix only review findings with these priorities: P1" in prompt
     assert "Do not address findings with other priorities" in prompt
     assert "Do not commit changes" in prompt
+
+
+def test_resume_summary_prompt_reuses_prior_summary_and_requires_sections():
+    issue = Issue(123, "Bug title", "Bug body", ["ai-ready"], "open")
+    diff = DiffSummary(["src/app.py"], " src/app.py | 2 +-", 2, False, None)
+    verify = VerifyResult(True, [CommandResult("pytest", 0, "ok", "", 1.0)])
+
+    prompt = build_resume_summary_prompt(
+        issue,
+        diff,
+        verify,
+        previous_summary="## What changed\n- Old point\n",
+    )
+
+    assert "Resume summary task" in prompt
+    assert "## Previous resume summary" in prompt
+    assert "Old point" in prompt
+    assert "Use exactly these sections" in prompt
+    assert "## What changed" in prompt
+    assert "## Decisions to preserve" in prompt
+    assert "## Follow-up context" in prompt
 
 
 def test_issue_draft_prompt_requires_json_output(tmp_path: Path):

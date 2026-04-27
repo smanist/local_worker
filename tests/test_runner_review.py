@@ -4,7 +4,7 @@ from pathlib import Path
 from ai_issue_worker.config import config_from_dict
 from ai_issue_worker.jobs import write_job_record
 from ai_issue_worker.models import AgentResult, CommandResult, DiffSummary, DiscussionComment, Issue, JobRecord, VerifyResult
-from ai_issue_worker.runner import EXIT_OK, _diff_snapshot, _run_agent_and_verify, blocking_review_priorities, process_issue_resume, run_once, select_work_plan
+from ai_issue_worker.runner import EXIT_OK, IssueWorkPlan, _diff_snapshot, _run_agent_and_verify, blocking_review_priorities, process_issue, process_issue_resume, run_once, select_work_plan
 
 
 def _issue() -> Issue:
@@ -308,6 +308,12 @@ def test_process_issue_resume_reuses_existing_pr_and_includes_follow_up(monkeypa
     run_root = tmp_path / "runs"
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
+    issue_run_dir = run_root / "issue-123"
+    issue_run_dir.mkdir(parents=True)
+    (issue_run_dir / "summary.md").write_text(
+        "## What changed\n- Added nil handling.\n\n## Decisions to preserve\n- Keep the API stable.\n\n## Follow-up context\n- Watch edge cases.\n",
+        encoding="utf-8",
+    )
     previous = JobRecord(
         issue_number=123,
         issue_title="Bug title",
@@ -360,7 +366,13 @@ def test_process_issue_resume_reuses_existing_pr_and_includes_follow_up(monkeypa
             updated_pr["title"] = title
             updated_pr["body"] = body_file.read_text(encoding="utf-8")
 
-    outputs = iter(["implementation complete", "BLOCKING_PRIORITIES: NONE\n\nNo findings."])
+    outputs = iter(
+        [
+            "implementation complete",
+            "BLOCKING_PRIORITIES: NONE\n\nNo findings.",
+            "## What changed\n- Added regression coverage.\n\n## Decisions to preserve\n- Keep the API stable.\n\n## Follow-up context\n- Review any additional nil-like edge cases.\n",
+        ]
+    )
 
     def fake_codex(config, worktree_path, prompt_path, log_path, command=None):
         prompts.append(prompt_path.read_text(encoding="utf-8"))
@@ -403,11 +415,250 @@ def test_process_issue_resume_reuses_existing_pr_and_includes_follow_up(monkeypa
     prompt = prompts[0]
     assert "## Continuation context" in prompt
     assert "Address the reviewer feedback without changing the public API." in prompt
+    assert "## Prior implementation summary" in prompt
+    assert "Added nil handling." in prompt
     assert "Please add a regression test." in prompt
     assert "Handle the nil case too." in prompt
     assert "One more edge case looks untested." in prompt
     assert "Draft PR opened:" not in prompt
     assert "Old review" not in prompt
+    summary = (issue_run_dir / "summary.md").read_text(encoding="utf-8")
+    assert "Added regression coverage." in summary
+    assert "Keep the API stable." in summary
+
+
+def test_process_issue_resume_skips_stale_summary_after_failed_run(monkeypatch, tmp_path: Path):
+    config = config_from_dict({"repo": "owner/repo", "verify": {"commands": ["pytest"]}})
+    run_root = tmp_path / "runs"
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    issue_run_dir = run_root / "issue-123"
+    issue_run_dir.mkdir(parents=True)
+    (issue_run_dir / "summary.md").write_text(
+        "## What changed\n- Stale summary.\n\n## Decisions to preserve\n- Old constraint.\n\n## Follow-up context\n- Old note.\n",
+        encoding="utf-8",
+    )
+    previous = JobRecord(
+        issue_number=123,
+        issue_title="Bug title",
+        branch_name="ai/issue-123-bug-title",
+        worktree_path=str(worktree_path),
+        status="verify_failed",
+        started_at="2026-01-01T00:00:00Z",
+        finished_at="2026-01-01T00:10:00Z",
+        base_branch="main",
+        pr_url="https://github.com/owner/repo/pull/5",
+    )
+    issue = Issue(123, "Bug title", "Bug body", ["ai-pr-opened"], "open")
+    prompts: list[str] = []
+
+    class FakeResumeGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def issue_comments(self, number: int):
+            return []
+
+        def pr_comments(self, pr_url: str):
+            return []
+
+        def pr_reviews(self, pr_url: str):
+            return []
+
+        def add_label(self, number: int, label: str) -> None:
+            pass
+
+        def remove_label(self, number: int, label: str) -> None:
+            pass
+
+        def comment(self, number: int, body_file: Path) -> None:
+            pass
+
+        def update_pr(self, pr_url: str, title: str, body_file: Path) -> None:
+            pass
+
+    outputs = iter(
+        [
+            "implementation complete",
+            "BLOCKING_PRIORITIES: NONE\n\nNo findings.",
+            "## What changed\n- Refreshed summary.\n\n## Decisions to preserve\n- New constraint.\n\n## Follow-up context\n- New note.\n",
+        ]
+    )
+
+    def fake_codex(config, worktree_path, prompt_path, log_path, command=None):
+        prompts.append(prompt_path.read_text(encoding="utf-8"))
+        log_path.write_text("log", encoding="utf-8")
+        return AgentResult(True, 0, next(outputs), "", 0.1, False)
+
+    def fake_verifier(config, worktree_path, log_path):
+        log_path.write_text("PASS pytest", encoding="utf-8")
+        return VerifyResult(True, [CommandResult("pytest", 0, "ok", "", 0.1)])
+
+    monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeResumeGH)
+    monkeypatch.setattr("ai_issue_worker.runner._run_codex_session", fake_codex)
+    monkeypatch.setattr("ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff")
+    monkeypatch.setattr("ai_issue_worker.runner.run_verifier", fake_verifier)
+    monkeypatch.setattr("ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff())
+    monkeypatch.setattr("ai_issue_worker.runner.ensure_worktree", lambda path, branch: None)
+    monkeypatch.setattr("ai_issue_worker.runner.commit_all", lambda worktree_path, message: None)
+    monkeypatch.setattr("ai_issue_worker.runner.push_branch", lambda worktree_path, branch: None)
+    monkeypatch.setattr("ai_issue_worker.runner.remove_worktree", lambda worktree_path: None)
+
+    result = process_issue_resume(
+        config,
+        issue,
+        previous,
+        tmp_path,
+        {"run_root": run_root},
+        manual_note="Address the latest failure.",
+    )
+
+    assert result == EXIT_OK
+    prompt = prompts[0]
+    assert "## Prior implementation summary" not in prompt
+    assert "Stale summary." not in prompt
+
+
+def test_process_issue_writes_summary_for_future_resume(monkeypatch, tmp_path: Path):
+    config = config_from_dict({"repo": "owner/repo", "verify": {"commands": ["pytest"]}})
+    issue = Issue(123, "Bug title", "Bug body", ["ai-ready"], "open")
+    paths = {
+        "run_root": tmp_path / "runs",
+        "worktree_root": tmp_path / "worktrees",
+    }
+    worktree_path = paths["worktree_root"] / "issue-123"
+    worktree_path.mkdir(parents=True)
+    prompts: list[str] = []
+
+    class FakeGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def add_label(self, number: int, label: str) -> None:
+            pass
+
+        def remove_label(self, number: int, label: str) -> None:
+            pass
+
+        def comment(self, number: int, body_file: Path) -> None:
+            pass
+
+        def create_pr(self, base: str, head: str, title: str, body_file: Path, draft: bool = True) -> str:
+            assert base == "main"
+            assert head == "ai/issue-123-bug-title"
+            return "https://github.com/owner/repo/pull/123"
+
+    outputs = iter(
+        [
+            "implementation complete",
+            "BLOCKING_PRIORITIES: NONE\n\nNo findings.",
+            "## What changed\n- Added regression coverage.\n\n## Decisions to preserve\n- Keep the API stable.\n\n## Follow-up context\n- Resume from the existing PR if more comments arrive.\n",
+        ]
+    )
+
+    def fake_codex(config, worktree_path, prompt_path, log_path, command=None):
+        prompts.append(prompt_path.read_text(encoding="utf-8"))
+        log_path.write_text("log", encoding="utf-8")
+        return AgentResult(True, 0, next(outputs), "", 0.1, False)
+
+    def fake_verifier(config, worktree_path, log_path):
+        log_path.write_text("PASS pytest", encoding="utf-8")
+        return VerifyResult(True, [CommandResult("pytest", 0, "ok", "", 0.1)])
+
+    monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeGH)
+    monkeypatch.setattr("ai_issue_worker.runner.unique_branch_name", lambda git_config, number, title: "ai/issue-123-bug-title")
+    monkeypatch.setattr("ai_issue_worker.runner.add_worktree", lambda path, branch, base_branch: None)
+    monkeypatch.setattr("ai_issue_worker.runner._run_codex_session", fake_codex)
+    monkeypatch.setattr("ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff")
+    monkeypatch.setattr("ai_issue_worker.runner.run_verifier", fake_verifier)
+    monkeypatch.setattr("ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff())
+    monkeypatch.setattr("ai_issue_worker.runner.commit_all", lambda worktree_path, message: None)
+    monkeypatch.setattr("ai_issue_worker.runner.push_branch", lambda worktree_path, branch: None)
+    monkeypatch.setattr("ai_issue_worker.runner.remove_worktree", lambda worktree_path: None)
+
+    result = process_issue(
+        config,
+        IssueWorkPlan(issue=issue, base_branch="main"),
+        tmp_path,
+        paths,
+    )
+
+    assert result == EXIT_OK
+    assert any("Resume summary task" in prompt for prompt in prompts)
+    summary = (paths["run_root"] / "issue-123" / "summary.md").read_text(encoding="utf-8")
+    assert "Added regression coverage." in summary
+    assert "Keep the API stable." in summary
+
+
+def test_process_issue_writes_summary_when_review_is_disabled(monkeypatch, tmp_path: Path):
+    config = config_from_dict(
+        {"repo": "owner/repo", "verify": {"commands": ["pytest"]}, "review": {"enabled": False}}
+    )
+    issue = Issue(123, "Bug title", "Bug body", ["ai-ready"], "open")
+    paths = {
+        "run_root": tmp_path / "runs",
+        "worktree_root": tmp_path / "worktrees",
+    }
+    worktree_path = paths["worktree_root"] / "issue-123"
+    worktree_path.mkdir(parents=True)
+    prompt_targets: list[Path] = []
+    commands: list[str | None] = []
+
+    class FakeGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def add_label(self, number: int, label: str) -> None:
+            pass
+
+        def remove_label(self, number: int, label: str) -> None:
+            pass
+
+        def comment(self, number: int, body_file: Path) -> None:
+            pass
+
+        def create_pr(self, base: str, head: str, title: str, body_file: Path, draft: bool = True) -> str:
+            return "https://github.com/owner/repo/pull/123"
+
+    outputs = iter(
+        [
+            "implementation complete",
+            "## What changed\n- Added regression coverage.\n\n## Decisions to preserve\n- Keep the API stable.\n\n## Follow-up context\n- Resume from the existing PR if more comments arrive.\n",
+        ]
+    )
+
+    def fake_codex(config, worktree_path, prompt_path, log_path, command=None):
+        prompt_targets.append(worktree_path)
+        commands.append(command)
+        log_path.write_text("log", encoding="utf-8")
+        return AgentResult(True, 0, next(outputs), "", 0.1, False)
+
+    def fake_verifier(config, worktree_path, log_path):
+        log_path.write_text("PASS pytest", encoding="utf-8")
+        return VerifyResult(True, [CommandResult("pytest", 0, "ok", "", 0.1)])
+
+    monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeGH)
+    monkeypatch.setattr("ai_issue_worker.runner.unique_branch_name", lambda git_config, number, title: "ai/issue-123-bug-title")
+    monkeypatch.setattr("ai_issue_worker.runner.add_worktree", lambda path, branch, base_branch: None)
+    monkeypatch.setattr("ai_issue_worker.runner._run_codex_session", fake_codex)
+    monkeypatch.setattr("ai_issue_worker.runner.run_verifier", fake_verifier)
+    monkeypatch.setattr("ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff())
+    monkeypatch.setattr("ai_issue_worker.runner.commit_all", lambda worktree_path, message: None)
+    monkeypatch.setattr("ai_issue_worker.runner.push_branch", lambda worktree_path, branch: None)
+    monkeypatch.setattr("ai_issue_worker.runner.remove_worktree", lambda worktree_path: None)
+
+    result = process_issue(
+        config,
+        IssueWorkPlan(issue=issue, base_branch="main"),
+        tmp_path,
+        paths,
+    )
+
+    assert result == EXIT_OK
+    assert commands == [None, None]
+    assert prompt_targets[-1] == paths["run_root"] / "issue-123"
+    summary = (paths["run_root"] / "issue-123" / "summary.md").read_text(encoding="utf-8")
+    assert "Added regression coverage." in summary
 
 
 def test_run_once_dispatches_queued_resume(monkeypatch, tmp_path: Path):

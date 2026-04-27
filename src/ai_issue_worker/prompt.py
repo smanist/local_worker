@@ -8,6 +8,7 @@ from .verifier import format_verification_summary
 
 
 MAX_INSTRUCTION_CHARS = 12_000
+MAX_RESUME_SUMMARY_CHARS = 6_000
 
 
 def repository_instructions(repo_root: Path) -> str:
@@ -244,4 +245,65 @@ Diff stat:
 - Do not address findings with other priorities unless required to fix a configured blocking issue.
 - Do not revert unrelated useful changes unless needed.
 - Do not commit changes, create branches, or open pull requests.
+"""
+
+
+def build_resume_summary_prompt(
+    issue: Issue,
+    diff_summary: DiffSummary,
+    verify: VerifyResult,
+    previous_summary: str = "",
+) -> str:
+    previous_summary_section = ""
+    if previous_summary.strip():
+        previous_summary_section = f"""
+## Previous resume summary
+
+{previous_summary.strip()[:MAX_RESUME_SUMMARY_CHARS]}
+"""
+    return f"""# Resume summary task
+
+You are preparing a short local summary for a future resume session on GitHub issue #{issue.number}. Do not edit files.
+
+## Issue title
+
+{issue.title}
+
+## Issue body
+
+{issue.body}
+{previous_summary_section}
+
+## Current git diff summary
+
+Changed files:
+{chr(10).join(diff_summary.changed_files)}
+
+Diff stat:
+{diff_summary.diff_stat}
+
+## Verification summary
+
+{format_verification_summary(verify)}
+
+## Instructions
+
+- Summarize the current implementation state for the next resume session.
+- Prefer concrete decisions, constraints, and follow-up context over restating the issue.
+- Replace outdated points from the previous summary instead of preserving stale context.
+- Keep the response concise and in Markdown.
+- Do not edit files, commit changes, create branches, or open pull requests.
+
+## Output format
+
+Use exactly these sections:
+
+## What changed
+- ...
+
+## Decisions to preserve
+- ...
+
+## Follow-up context
+- ...
 """

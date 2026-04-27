@@ -13,12 +13,12 @@ from .config import ConfigError, IssueSelectionConfig, WorkerConfig, load_config
 from .diff_policy import inspect_diff
 from .github_gh import GHClient, GHError
 from .issue_selection import candidate_issues
-from .jobs import copy_artifact, issue_run_dir, load_job_record, record_artifact_file, record_codex_token_usage, utc_iso, utc_timestamp, write_job_record, write_single_artifact, write_text_artifact
+from .jobs import append_artifact_log, copy_artifact, issue_run_dir, load_job_record, record_artifact_file, record_codex_token_usage, utc_iso, utc_timestamp, write_job_record, write_single_artifact, write_text_artifact
 from .locking import FileLock, LockHeld
 from .models import DiffSummary, DiscussionComment, Issue, JobRecord, VerifyResult
 from .pr import build_pr_body, render_template
 from .privacy import sanitize_user_paths
-from .prompt import build_prompt, build_repair_prompt, build_review_fix_prompt, build_review_prompt
+from .prompt import build_prompt, build_repair_prompt, build_resume_summary_prompt, build_review_fix_prompt, build_review_prompt
 from .shell import run_cmd
 from .verifier import format_verification_summary, run_verifier
 from .worktree import GitError, add_worktree, commit_all, ensure_worktree, push_branch, remove_worktree, unique_branch_name
@@ -37,6 +37,7 @@ EXIT_LOCK = 8
 
 REVIEW_FINDING_RE = re.compile(r"^\s*(?:[-*]\s*)?(?:\[(P[0-3])\]|(P[0-3])\s*[:\-])", re.MULTILINE)
 MAX_FOLLOW_UP_CHARS = 12_000
+MAX_SUMMARY_CHARS = 6_000
 WORKER_COMMENT_PREFIXES = (
     "Draft PR opened:",
     "Updated PR:",
@@ -227,8 +228,18 @@ def _render_follow_up_comment(comment: DiscussionComment) -> str:
     return f"### {meta}\n\n{body}"
 
 
-def _build_follow_up(pr_url: str, manual_note: str, comments: list[DiscussionComment]) -> str:
+def _build_follow_up(
+    pr_url: str,
+    manual_note: str,
+    previous_summary: str,
+    comments: list[DiscussionComment],
+) -> str:
     sections = [f"Continue work on the existing pull request for this issue: {pr_url}"]
+    if previous_summary.strip():
+        sections.append(
+            "## Prior implementation summary\n\n"
+            + previous_summary.strip()[:MAX_SUMMARY_CHARS]
+        )
     if manual_note.strip():
         sections.append(f"### Local operator note\n\n{manual_note.strip()}")
 
@@ -279,10 +290,30 @@ def _latest_resume_job(paths: dict[str, Path], issue_number: int) -> JobRecord |
     return record
 
 
+def _latest_summary(paths: dict[str, Path], issue_number: int) -> str:
+    summary_path = issue_run_dir(paths["run_root"], issue_number) / "summary.md"
+    if not summary_path.exists():
+        return ""
+    try:
+        return summary_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _resume_summary_context(paths: dict[str, Path], previous_record: JobRecord) -> str:
+    # Only reuse a stored summary when the latest recorded state matches the
+    # last PR-opened snapshot. Failed resume attempts may leave a worktree that
+    # has drifted beyond that summary.
+    if previous_record.status != "pr_opened":
+        return ""
+    return _latest_summary(paths, previous_record.issue_number)
+
+
 def _resume_discussion(
     gh: GHClient,
     issue_number: int,
     previous_record: JobRecord,
+    previous_summary: str,
     manual_note: str = "",
 ) -> str:
     cutoff = _resume_cutoff(previous_record)
@@ -297,7 +328,7 @@ def _resume_discussion(
         if not _is_worker_comment(comment) and _is_newer_comment(comment, cutoff)
     ]
     fresh.sort(key=lambda comment: comment.created_at or "")
-    return _build_follow_up(previous_record.pr_url or "", manual_note, fresh)
+    return _build_follow_up(previous_record.pr_url or "", manual_note, previous_summary, fresh)
 
 
 def _failure_status(failure_kind: str) -> str:
@@ -608,6 +639,41 @@ def _run_agent_and_verify(
     return _run_review_loop(config, issue, repo_root, worktree_path, run_dir, stamp, verify, diff)
 
 
+def _write_resume_summary(
+    config: WorkerConfig,
+    issue: Issue,
+    run_dir: Path,
+    stamp: str,
+    diff: DiffSummary,
+    verify: VerifyResult,
+    previous_summary: str = "",
+) -> str:
+    summary_prompt = build_resume_summary_prompt(issue, diff, verify, previous_summary=previous_summary)
+    summary_prompt_path = run_dir / f"prompt-{stamp}-summary.md"
+    write_text_artifact(summary_prompt_path, run_dir / "prompt.md", summary_prompt)
+    summary_command = config.review.command if config.review.enabled else None
+    summary = _run_codex_session(
+        config,
+        run_dir,
+        summary_prompt_path,
+        run_dir / f"codex-{stamp}-summary.log",
+        command=summary_command,
+    )
+    summary_output = (summary.stdout.strip() or summary.stderr.strip()).strip()
+    if not summary.success:
+        append_artifact_log(
+            run_dir,
+            f"resume summary generation failed with exit code {summary.exit_code}",
+        )
+        return ""
+    if not summary_output:
+        append_artifact_log(run_dir, "resume summary generation completed without output")
+        return ""
+    summary_path = run_dir / f"summary-{stamp}.md"
+    write_text_artifact(summary_path, run_dir / "summary.md", summary_output)
+    return summary_output
+
+
 def _finalize_pr_success(
     gh: GHClient,
     config: WorkerConfig,
@@ -714,6 +780,7 @@ def process_issue(config: WorkerConfig, plan: IssueWorkPlan, repo_root: Path, pa
         success_message="Draft PR opened",
         remove_ready_label=True,
     )
+    _write_resume_summary(config, issue, run_dir, stamp, diff, verify)
     if not config.git.keep_worktree_on_success:
         try:
             remove_worktree(worktree_path)
@@ -787,6 +854,7 @@ def process_issue_resume(
     worktree_path = Path(previous_record.worktree_path)
     run_dir = issue_run_dir(paths["run_root"], issue.number)
     run_dir.mkdir(parents=True, exist_ok=True)
+    previous_summary = _resume_summary_context(paths, previous_record)
     record = _record_for(
         issue,
         branch,
@@ -801,7 +869,7 @@ def process_issue_resume(
     )
     write_job_record(run_dir, record, stamp)
 
-    follow_up = _resume_discussion(gh, issue.number, previous_record, manual_note)
+    follow_up = _resume_discussion(gh, issue.number, previous_record, previous_summary, manual_note)
 
     try:
         gh.add_label(issue.number, config.issue_selection.working_label)
@@ -880,6 +948,15 @@ def process_issue_resume(
         pr_url,
         success_message="Updated PR",
         remove_ready_label=False,
+    )
+    _write_resume_summary(
+        config,
+        issue,
+        run_dir,
+        stamp,
+        diff,
+        verify,
+        previous_summary=previous_summary,
     )
     if not config.git.keep_worktree_on_success:
         try:

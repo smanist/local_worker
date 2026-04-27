@@ -48,6 +48,7 @@ This is the repo's center of gravity.
 - Computes workable issue plans, including stacked PR base-branch selection.
 - Builds prompts and invokes Codex sessions.
 - Runs verifier and review/fix loops.
+- Generates a best-effort resume summary artifact after successful PR creation or update.
 - Applies diff policy.
 - Writes job records and artifact logs.
 - Finalizes GitHub labels/comments and git cleanup.
@@ -75,7 +76,7 @@ When making behavioral changes, start here and verify the corresponding tests in
 
 - `issue_selection.py`: label-based selection ordering and exclusions.
 - `diff_policy.py`: file-count, diff-size, path, lockfile, and diff-check enforcement.
-- `prompt.py`: implementation, repair, review, review-fix, and issue-draft prompt builders.
+- `prompt.py`: implementation, repair, review, review-fix, resume-summary, and issue-draft prompt builders.
 - `privacy.py`: scrubs local home-directory paths before text leaves the machine.
 - `jobs.py`: timestamped artifacts, `latest.*` copies, job record persistence, and token-usage summaries.
 - `locking.py`: non-blocking file lock used by the worker loop.
@@ -100,6 +101,7 @@ Per-issue run directories contain both timestamped files and latest aliases. Com
 - `codex-<stamp>.log` and `codex.log`
 - `verify-<stamp>.log` and `verify.log`
 - `review-<stamp>.md` and `review.md`
+- `summary-<stamp>.md` and `summary.md`
 - `pr-body-<stamp>.md` and `pr_body.md`
 - `artifacts.log`
 

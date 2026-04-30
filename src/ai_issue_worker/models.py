@@ -13,11 +13,20 @@ class Issue:
     state: str
     url: str | None = None
     updated_at: str | None = None
+    id: int | None = None
 
     @classmethod
     def from_gh(cls, data: dict[str, Any]) -> "Issue":
         labels = data.get("labels") or []
-        names = [item["name"] if isinstance(item, dict) else str(item) for item in labels]
+        names = [
+            item["name"] if isinstance(item, dict) else str(item) for item in labels
+        ]
+        raw_id = data.get("id") or data.get("databaseId") or data.get("database_id")
+        issue_id = (
+            int(raw_id)
+            if isinstance(raw_id, int | str) and str(raw_id).isdigit()
+            else None
+        )
         return cls(
             number=int(data["number"]),
             title=data.get("title") or "",
@@ -26,7 +35,16 @@ class Issue:
             state=data.get("state") or "",
             url=data.get("url"),
             updated_at=data.get("updatedAt") or data.get("updated_at"),
+            id=issue_id,
         )
+
+
+@dataclass(frozen=True)
+class CreatedIssue:
+    number: int
+    title: str
+    url: str
+    id: int
 
 
 @dataclass

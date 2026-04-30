@@ -2,9 +2,29 @@ import subprocess
 from pathlib import Path
 
 from ai_issue_worker.config import config_from_dict
-from ai_issue_worker.jobs import write_job_record
-from ai_issue_worker.models import AgentResult, CommandResult, DiffSummary, DiscussionComment, Issue, JobRecord, VerifyResult
-from ai_issue_worker.runner import EXIT_OK, IssueWorkPlan, _diff_snapshot, _run_agent_and_verify, blocking_review_priorities, process_issue, process_issue_resume, run_once, select_work_plan
+from ai_issue_worker.jobs import load_job_record, write_job_record
+from ai_issue_worker.models import (
+    AgentResult,
+    CommandResult,
+    DiffSummary,
+    DiscussionComment,
+    Issue,
+    JobRecord,
+    VerifyResult,
+)
+from ai_issue_worker.runner import (
+    EXIT_OK,
+    EXIT_VERIFY,
+    IssueWorkPlan,
+    _diff_snapshot,
+    _run_agent_and_verify,
+    blocking_review_priorities,
+    process_issue,
+    process_issue_resume,
+    process_parent_issue,
+    run_once,
+    select_work_plan,
+)
 
 
 def _issue() -> Issue:
@@ -41,7 +61,9 @@ def test_select_workable_issue_skips_candidates_with_open_blockers():
     config = config_from_dict({"repo": "owner/repo"}).issue_selection
     paths = {"run_root": Path("/missing")}
     issues = [
-        Issue(1, "Blocked", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z"),
+        Issue(
+            1, "Blocked", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z"
+        ),
         Issue(2, "Ready", "", ["ai-ready"], "open", updated_at="2026-01-02T00:00:00Z"),
     ]
     gh = FakeDependencyGH({1: [Issue(10, "Blocker", "", [], "open")]})
@@ -56,7 +78,11 @@ def test_select_workable_issue_skips_candidates_with_open_blockers():
 def test_select_workable_issue_allows_candidates_with_closed_blockers():
     config = config_from_dict({"repo": "owner/repo"}).issue_selection
     paths = {"run_root": Path("/missing")}
-    issues = [Issue(1, "Unblocked", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
+    issues = [
+        Issue(
+            1, "Unblocked", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z"
+        )
+    ]
     gh = FakeDependencyGH({1: [Issue(10, "Done blocker", "", [], "closed")]})
 
     plan = select_work_plan(gh, issues, config, "main", paths)
@@ -70,7 +96,16 @@ def test_select_workable_issue_can_ignore_dependency_checks():
         {"repo": "owner/repo", "issue_selection": {"respect_issue_dependencies": False}}
     ).issue_selection
     paths = {"run_root": Path("/missing")}
-    issues = [Issue(1, "Blocked but selected", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
+    issues = [
+        Issue(
+            1,
+            "Blocked but selected",
+            "",
+            ["ai-ready"],
+            "open",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+    ]
     gh = FakeDependencyGH({1: [Issue(10, "Blocker", "", [], "open")]})
 
     plan = select_work_plan(gh, issues, config, "main", paths)
@@ -80,7 +115,9 @@ def test_select_workable_issue_can_ignore_dependency_checks():
     assert gh.checked == []
 
 
-def _write_pr_job(run_root: Path, issue_number: int, branch_name: str, stack_depth: int = 0) -> None:
+def _write_pr_job(
+    run_root: Path, issue_number: int, branch_name: str, stack_depth: int = 0
+) -> None:
     write_job_record(
         run_root / f"issue-{issue_number}",
         JobRecord(
@@ -100,11 +137,23 @@ def _write_pr_job(run_root: Path, issue_number: int, branch_name: str, stack_dep
 
 def test_select_workable_issue_stacks_on_blocker_pr_branch(tmp_path: Path):
     config = config_from_dict(
-        {"repo": "owner/repo", "issue_selection": {"allow_stacked_prs": True, "max_stack_depth": 3}}
+        {
+            "repo": "owner/repo",
+            "issue_selection": {"allow_stacked_prs": True, "max_stack_depth": 3},
+        }
     ).issue_selection
     paths = {"run_root": tmp_path}
     _write_pr_job(tmp_path, 10, "ai/issue-10-base", stack_depth=0)
-    issues = [Issue(11, "Downstream", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
+    issues = [
+        Issue(
+            11,
+            "Downstream",
+            "",
+            ["ai-ready"],
+            "open",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+    ]
     gh = FakeDependencyGH({11: [Issue(10, "Blocker", "", [], "open")]})
 
     plan = select_work_plan(gh, issues, config, "main", paths)
@@ -116,9 +165,20 @@ def test_select_workable_issue_stacks_on_blocker_pr_branch(tmp_path: Path):
 
 
 def test_select_workable_issue_skips_stacking_without_blocker_pr(tmp_path: Path):
-    config = config_from_dict({"repo": "owner/repo", "issue_selection": {"allow_stacked_prs": True}}).issue_selection
+    config = config_from_dict(
+        {"repo": "owner/repo", "issue_selection": {"allow_stacked_prs": True}}
+    ).issue_selection
     paths = {"run_root": tmp_path}
-    issues = [Issue(11, "Downstream", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
+    issues = [
+        Issue(
+            11,
+            "Downstream",
+            "",
+            ["ai-ready"],
+            "open",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+    ]
     gh = FakeDependencyGH({11: [Issue(10, "Blocker", "", [], "open")]})
 
     plan = select_work_plan(gh, issues, config, "main", paths)
@@ -127,12 +187,30 @@ def test_select_workable_issue_skips_stacking_without_blocker_pr(tmp_path: Path)
 
 
 def test_select_workable_issue_skips_multiple_open_blockers(tmp_path: Path):
-    config = config_from_dict({"repo": "owner/repo", "issue_selection": {"allow_stacked_prs": True}}).issue_selection
+    config = config_from_dict(
+        {"repo": "owner/repo", "issue_selection": {"allow_stacked_prs": True}}
+    ).issue_selection
     paths = {"run_root": tmp_path}
     _write_pr_job(tmp_path, 10, "ai/issue-10-a")
     _write_pr_job(tmp_path, 20, "ai/issue-20-b")
-    issues = [Issue(30, "Downstream", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
-    gh = FakeDependencyGH({30: [Issue(10, "Blocker A", "", [], "open"), Issue(20, "Blocker B", "", [], "open")]})
+    issues = [
+        Issue(
+            30,
+            "Downstream",
+            "",
+            ["ai-ready"],
+            "open",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+    ]
+    gh = FakeDependencyGH(
+        {
+            30: [
+                Issue(10, "Blocker A", "", [], "open"),
+                Issue(20, "Blocker B", "", [], "open"),
+            ]
+        }
+    )
 
     plan = select_work_plan(gh, issues, config, "main", paths)
 
@@ -141,11 +219,23 @@ def test_select_workable_issue_skips_multiple_open_blockers(tmp_path: Path):
 
 def test_select_workable_issue_respects_max_stack_depth(tmp_path: Path):
     config = config_from_dict(
-        {"repo": "owner/repo", "issue_selection": {"allow_stacked_prs": True, "max_stack_depth": 1}}
+        {
+            "repo": "owner/repo",
+            "issue_selection": {"allow_stacked_prs": True, "max_stack_depth": 1},
+        }
     ).issue_selection
     paths = {"run_root": tmp_path}
     _write_pr_job(tmp_path, 10, "ai/issue-10-base", stack_depth=1)
-    issues = [Issue(11, "Downstream", "", ["ai-ready"], "open", updated_at="2026-01-01T00:00:00Z")]
+    issues = [
+        Issue(
+            11,
+            "Downstream",
+            "",
+            ["ai-ready"],
+            "open",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+    ]
     gh = FakeDependencyGH({11: [Issue(10, "Blocker", "", [], "open")]})
 
     plan = select_work_plan(gh, issues, config, "main", paths)
@@ -158,7 +248,14 @@ def test_select_workable_issue_can_pick_queued_resume(tmp_path: Path):
     paths = {"run_root": tmp_path}
     _write_pr_job(tmp_path, 12, "ai/issue-12-existing")
     issues = [
-        Issue(12, "Resume", "", ["ai-pr-opened", "ai-resume"], "open", updated_at="2026-01-01T00:00:00Z"),
+        Issue(
+            12,
+            "Resume",
+            "",
+            ["ai-pr-opened", "ai-resume"],
+            "open",
+            updated_at="2026-01-01T00:00:00Z",
+        ),
         Issue(13, "Fresh", "", ["ai-ready"], "open", updated_at="2026-01-02T00:00:00Z"),
     ]
     gh = FakeDependencyGH({})
@@ -169,11 +266,34 @@ def test_select_workable_issue_can_pick_queued_resume(tmp_path: Path):
     assert plan.mode == "resume"
     assert plan.resume_record is not None
     assert plan.resume_record.branch_name == "ai/issue-12-existing"
-    assert gh.checked == [13]
+
+
+def test_select_workable_issue_marks_parent_mode():
+    config = config_from_dict({"repo": "owner/repo"}).issue_selection
+    paths = {"run_root": Path("/missing")}
+    issues = [
+        Issue(
+            1,
+            "Parent",
+            "",
+            ["ai-ready", "ai-parent"],
+            "open",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+    ]
+    gh = FakeDependencyGH({})
+
+    plan = select_work_plan(gh, issues, config, "main", paths)
+
+    assert plan and plan.issue.number == 1
+    assert plan.mode == "parent"
+    assert gh.checked == []
 
 
 def test_run_agent_review_fix_loop_until_clean(monkeypatch, tmp_path: Path):
-    config = config_from_dict({"repo": "owner/repo", "verify": {"commands": ["pytest"]}})
+    config = config_from_dict(
+        {"repo": "owner/repo", "verify": {"commands": ["pytest"]}}
+    )
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     calls: list[str] = []
@@ -202,9 +322,13 @@ def test_run_agent_review_fix_loop_until_clean(monkeypatch, tmp_path: Path):
         return VerifyResult(True, [CommandResult("pytest", 0, "ok", "", 0.1)])
 
     monkeypatch.setattr("ai_issue_worker.runner._run_codex_session", fake_codex)
-    monkeypatch.setattr("ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff")
+    monkeypatch.setattr(
+        "ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff"
+    )
     monkeypatch.setattr("ai_issue_worker.runner.run_verifier", fake_verifier)
-    monkeypatch.setattr("ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff())
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff()
+    )
 
     ok, verify, diff, error, failure_kind = _run_agent_and_verify(
         config,
@@ -220,12 +344,19 @@ def test_run_agent_review_fix_loop_until_clean(monkeypatch, tmp_path: Path):
     assert diff.changed_files == ["src/app.py"]
     assert error == ""
     assert failure_kind == ""
-    assert calls == ["# Task", "# Code review task", "# Review fix task", "# Code review task"]
+    assert calls == [
+        "# Task",
+        "# Code review task",
+        "# Review fix task",
+        "# Code review task",
+    ]
     assert commands == [None, config.review.command, None, config.review.command]
     assert verify_count == 2
 
 
-def test_run_agent_review_loop_stops_after_max_fix_iterations(monkeypatch, tmp_path: Path):
+def test_run_agent_review_loop_stops_after_max_fix_iterations(
+    monkeypatch, tmp_path: Path
+):
     config = config_from_dict({"repo": "owner/repo", "review": {"max_iterations": 1}})
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -247,9 +378,13 @@ def test_run_agent_review_loop_stops_after_max_fix_iterations(monkeypatch, tmp_p
         return VerifyResult(True, [CommandResult("pytest", 0, "ok", "", 0.1)])
 
     monkeypatch.setattr("ai_issue_worker.runner._run_codex_session", fake_codex)
-    monkeypatch.setattr("ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff")
+    monkeypatch.setattr(
+        "ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff"
+    )
     monkeypatch.setattr("ai_issue_worker.runner.run_verifier", fake_verifier)
-    monkeypatch.setattr("ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff())
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff()
+    )
 
     ok, verify, diff, error, failure_kind = _run_agent_and_verify(
         config,
@@ -268,11 +403,15 @@ def test_run_agent_review_loop_stops_after_max_fix_iterations(monkeypatch, tmp_p
     assert failure_kind == "review"
 
 
-def test_run_agent_fails_when_review_session_modifies_worktree(monkeypatch, tmp_path: Path):
+def test_run_agent_fails_when_review_session_modifies_worktree(
+    monkeypatch, tmp_path: Path
+):
     config = config_from_dict({"repo": "owner/repo"})
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    outputs = iter(["implementation complete", "BLOCKING_PRIORITIES: NONE\n\nNo findings."])
+    outputs = iter(
+        ["implementation complete", "BLOCKING_PRIORITIES: NONE\n\nNo findings."]
+    )
     snapshots = iter(["before-review", "after-review"])
 
     def fake_codex(config, worktree_path, prompt_path, log_path, command=None):
@@ -284,9 +423,13 @@ def test_run_agent_fails_when_review_session_modifies_worktree(monkeypatch, tmp_
         return VerifyResult(True, [CommandResult("pytest", 0, "ok", "", 0.1)])
 
     monkeypatch.setattr("ai_issue_worker.runner._run_codex_session", fake_codex)
-    monkeypatch.setattr("ai_issue_worker.runner._diff_snapshot", lambda worktree_path: next(snapshots))
+    monkeypatch.setattr(
+        "ai_issue_worker.runner._diff_snapshot", lambda worktree_path: next(snapshots)
+    )
     monkeypatch.setattr("ai_issue_worker.runner.run_verifier", fake_verifier)
-    monkeypatch.setattr("ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff())
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff()
+    )
 
     ok, verify, diff, error, failure_kind = _run_agent_and_verify(
         config,
@@ -303,8 +446,12 @@ def test_run_agent_fails_when_review_session_modifies_worktree(monkeypatch, tmp_
     assert "modified the worktree" in error
 
 
-def test_process_issue_resume_reuses_existing_pr_and_includes_follow_up(monkeypatch, tmp_path: Path):
-    config = config_from_dict({"repo": "owner/repo", "verify": {"commands": ["pytest"]}})
+def test_process_issue_resume_reuses_existing_pr_and_includes_follow_up(
+    monkeypatch, tmp_path: Path
+):
+    config = config_from_dict(
+        {"repo": "owner/repo", "verify": {"commands": ["pytest"]}}
+    )
     run_root = tmp_path / "runs"
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
@@ -337,19 +484,43 @@ def test_process_issue_resume_reuses_existing_pr_and_includes_follow_up(monkeypa
         def issue_comments(self, number: int):
             assert number == 123
             return [
-                DiscussionComment("issue comment", "Draft PR opened: https://github.com/owner/repo/pull/5", "worker", "2026-01-02T00:00:00Z"),
-                DiscussionComment("issue comment", "Please add a regression test.", "alice", "2026-01-02T00:01:00Z"),
+                DiscussionComment(
+                    "issue comment",
+                    "Draft PR opened: https://github.com/owner/repo/pull/5",
+                    "worker",
+                    "2026-01-02T00:00:00Z",
+                ),
+                DiscussionComment(
+                    "issue comment",
+                    "Please add a regression test.",
+                    "alice",
+                    "2026-01-02T00:01:00Z",
+                ),
             ]
 
         def pr_comments(self, pr_url: str):
             assert pr_url == previous.pr_url
-            return [DiscussionComment("pull request comment", "Handle the nil case too.", "bob", "2026-01-02T00:02:00Z")]
+            return [
+                DiscussionComment(
+                    "pull request comment",
+                    "Handle the nil case too.",
+                    "bob",
+                    "2026-01-02T00:02:00Z",
+                )
+            ]
 
         def pr_reviews(self, pr_url: str):
             assert pr_url == previous.pr_url
             return [
-                DiscussionComment("pull request review", "Old review", "carol", "2026-01-01T00:05:00Z"),
-                DiscussionComment("pull request review", "One more edge case looks untested.", "dora", "2026-01-02T00:03:00Z"),
+                DiscussionComment(
+                    "pull request review", "Old review", "carol", "2026-01-01T00:05:00Z"
+                ),
+                DiscussionComment(
+                    "pull request review",
+                    "One more edge case looks untested.",
+                    "dora",
+                    "2026-01-02T00:03:00Z",
+                ),
             ]
 
         def add_label(self, number: int, label: str) -> None:
@@ -389,13 +560,23 @@ def test_process_issue_resume_reuses_existing_pr_and_includes_follow_up(monkeypa
 
     monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeResumeGH)
     monkeypatch.setattr("ai_issue_worker.runner._run_codex_session", fake_codex)
-    monkeypatch.setattr("ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff")
+    monkeypatch.setattr(
+        "ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff"
+    )
     monkeypatch.setattr("ai_issue_worker.runner.run_verifier", fake_verifier)
-    monkeypatch.setattr("ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff())
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff()
+    )
     monkeypatch.setattr("ai_issue_worker.runner.ensure_worktree", fake_ensure_worktree)
-    monkeypatch.setattr("ai_issue_worker.runner.commit_all", lambda worktree_path, message: None)
-    monkeypatch.setattr("ai_issue_worker.runner.push_branch", lambda worktree_path, branch: None)
-    monkeypatch.setattr("ai_issue_worker.runner.remove_worktree", lambda worktree_path: None)
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.commit_all", lambda worktree_path, message: None
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.push_branch", lambda worktree_path, branch: None
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.remove_worktree", lambda worktree_path: None
+    )
 
     result = process_issue_resume(
         config,
@@ -427,8 +608,12 @@ def test_process_issue_resume_reuses_existing_pr_and_includes_follow_up(monkeypa
     assert "Keep the API stable." in summary
 
 
-def test_process_issue_resume_skips_stale_summary_after_failed_run(monkeypatch, tmp_path: Path):
-    config = config_from_dict({"repo": "owner/repo", "verify": {"commands": ["pytest"]}})
+def test_process_issue_resume_skips_stale_summary_after_failed_run(
+    monkeypatch, tmp_path: Path
+):
+    config = config_from_dict(
+        {"repo": "owner/repo", "verify": {"commands": ["pytest"]}}
+    )
     run_root = tmp_path / "runs"
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
@@ -496,13 +681,25 @@ def test_process_issue_resume_skips_stale_summary_after_failed_run(monkeypatch, 
 
     monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeResumeGH)
     monkeypatch.setattr("ai_issue_worker.runner._run_codex_session", fake_codex)
-    monkeypatch.setattr("ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff")
+    monkeypatch.setattr(
+        "ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff"
+    )
     monkeypatch.setattr("ai_issue_worker.runner.run_verifier", fake_verifier)
-    monkeypatch.setattr("ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff())
-    monkeypatch.setattr("ai_issue_worker.runner.ensure_worktree", lambda path, branch: None)
-    monkeypatch.setattr("ai_issue_worker.runner.commit_all", lambda worktree_path, message: None)
-    monkeypatch.setattr("ai_issue_worker.runner.push_branch", lambda worktree_path, branch: None)
-    monkeypatch.setattr("ai_issue_worker.runner.remove_worktree", lambda worktree_path: None)
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff()
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.ensure_worktree", lambda path, branch: None
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.commit_all", lambda worktree_path, message: None
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.push_branch", lambda worktree_path, branch: None
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.remove_worktree", lambda worktree_path: None
+    )
 
     result = process_issue_resume(
         config,
@@ -520,7 +717,9 @@ def test_process_issue_resume_skips_stale_summary_after_failed_run(monkeypatch, 
 
 
 def test_process_issue_writes_summary_for_future_resume(monkeypatch, tmp_path: Path):
-    config = config_from_dict({"repo": "owner/repo", "verify": {"commands": ["pytest"]}})
+    config = config_from_dict(
+        {"repo": "owner/repo", "verify": {"commands": ["pytest"]}}
+    )
     issue = Issue(123, "Bug title", "Bug body", ["ai-ready"], "open")
     paths = {
         "run_root": tmp_path / "runs",
@@ -543,7 +742,9 @@ def test_process_issue_writes_summary_for_future_resume(monkeypatch, tmp_path: P
         def comment(self, number: int, body_file: Path) -> None:
             pass
 
-        def create_pr(self, base: str, head: str, title: str, body_file: Path, draft: bool = True) -> str:
+        def create_pr(
+            self, base: str, head: str, title: str, body_file: Path, draft: bool = True
+        ) -> str:
             assert base == "main"
             assert head == "ai/issue-123-bug-title"
             return "https://github.com/owner/repo/pull/123"
@@ -566,15 +767,30 @@ def test_process_issue_writes_summary_for_future_resume(monkeypatch, tmp_path: P
         return VerifyResult(True, [CommandResult("pytest", 0, "ok", "", 0.1)])
 
     monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeGH)
-    monkeypatch.setattr("ai_issue_worker.runner.unique_branch_name", lambda git_config, number, title: "ai/issue-123-bug-title")
-    monkeypatch.setattr("ai_issue_worker.runner.add_worktree", lambda path, branch, base_branch: None)
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.unique_branch_name",
+        lambda git_config, number, title: "ai/issue-123-bug-title",
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.add_worktree", lambda path, branch, base_branch: None
+    )
     monkeypatch.setattr("ai_issue_worker.runner._run_codex_session", fake_codex)
-    monkeypatch.setattr("ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff")
+    monkeypatch.setattr(
+        "ai_issue_worker.runner._diff_snapshot", lambda worktree_path: "diff"
+    )
     monkeypatch.setattr("ai_issue_worker.runner.run_verifier", fake_verifier)
-    monkeypatch.setattr("ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff())
-    monkeypatch.setattr("ai_issue_worker.runner.commit_all", lambda worktree_path, message: None)
-    monkeypatch.setattr("ai_issue_worker.runner.push_branch", lambda worktree_path, branch: None)
-    monkeypatch.setattr("ai_issue_worker.runner.remove_worktree", lambda worktree_path: None)
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff()
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.commit_all", lambda worktree_path, message: None
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.push_branch", lambda worktree_path, branch: None
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.remove_worktree", lambda worktree_path: None
+    )
 
     result = process_issue(
         config,
@@ -585,14 +801,22 @@ def test_process_issue_writes_summary_for_future_resume(monkeypatch, tmp_path: P
 
     assert result == EXIT_OK
     assert any("Resume summary task" in prompt for prompt in prompts)
-    summary = (paths["run_root"] / "issue-123" / "summary.md").read_text(encoding="utf-8")
+    summary = (paths["run_root"] / "issue-123" / "summary.md").read_text(
+        encoding="utf-8"
+    )
     assert "Added regression coverage." in summary
     assert "Keep the API stable." in summary
 
 
-def test_process_issue_writes_summary_when_review_is_disabled(monkeypatch, tmp_path: Path):
+def test_process_issue_writes_summary_when_review_is_disabled(
+    monkeypatch, tmp_path: Path
+):
     config = config_from_dict(
-        {"repo": "owner/repo", "verify": {"commands": ["pytest"]}, "review": {"enabled": False}}
+        {
+            "repo": "owner/repo",
+            "verify": {"commands": ["pytest"]},
+            "review": {"enabled": False},
+        }
     )
     issue = Issue(123, "Bug title", "Bug body", ["ai-ready"], "open")
     paths = {
@@ -617,7 +841,9 @@ def test_process_issue_writes_summary_when_review_is_disabled(monkeypatch, tmp_p
         def comment(self, number: int, body_file: Path) -> None:
             pass
 
-        def create_pr(self, base: str, head: str, title: str, body_file: Path, draft: bool = True) -> str:
+        def create_pr(
+            self, base: str, head: str, title: str, body_file: Path, draft: bool = True
+        ) -> str:
             return "https://github.com/owner/repo/pull/123"
 
     outputs = iter(
@@ -638,14 +864,27 @@ def test_process_issue_writes_summary_when_review_is_disabled(monkeypatch, tmp_p
         return VerifyResult(True, [CommandResult("pytest", 0, "ok", "", 0.1)])
 
     monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeGH)
-    monkeypatch.setattr("ai_issue_worker.runner.unique_branch_name", lambda git_config, number, title: "ai/issue-123-bug-title")
-    monkeypatch.setattr("ai_issue_worker.runner.add_worktree", lambda path, branch, base_branch: None)
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.unique_branch_name",
+        lambda git_config, number, title: "ai/issue-123-bug-title",
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.add_worktree", lambda path, branch, base_branch: None
+    )
     monkeypatch.setattr("ai_issue_worker.runner._run_codex_session", fake_codex)
     monkeypatch.setattr("ai_issue_worker.runner.run_verifier", fake_verifier)
-    monkeypatch.setattr("ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff())
-    monkeypatch.setattr("ai_issue_worker.runner.commit_all", lambda worktree_path, message: None)
-    monkeypatch.setattr("ai_issue_worker.runner.push_branch", lambda worktree_path, branch: None)
-    monkeypatch.setattr("ai_issue_worker.runner.remove_worktree", lambda worktree_path: None)
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.inspect_diff", lambda worktree_path, config: _diff()
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.commit_all", lambda worktree_path, message: None
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.push_branch", lambda worktree_path, branch: None
+    )
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.remove_worktree", lambda worktree_path: None
+    )
 
     result = process_issue(
         config,
@@ -657,7 +896,9 @@ def test_process_issue_writes_summary_when_review_is_disabled(monkeypatch, tmp_p
     assert result == EXIT_OK
     assert commands == [None, None]
     assert prompt_targets[-1] == paths["run_root"] / "issue-123"
-    summary = (paths["run_root"] / "issue-123" / "summary.md").read_text(encoding="utf-8")
+    summary = (paths["run_root"] / "issue-123" / "summary.md").read_text(
+        encoding="utf-8"
+    )
     assert "Added regression coverage." in summary
 
 
@@ -677,11 +918,27 @@ def test_run_once_dispatches_queued_resume(monkeypatch, tmp_path: Path):
 
         def list_issues(self, labels):
             captured["labels"] = labels
-            return [Issue(77, "Resume", "", ["ai-pr-opened", "ai-resume"], "open", updated_at="2026-01-01T00:00:00Z")]
+            return [
+                Issue(
+                    77,
+                    "Resume",
+                    "",
+                    ["ai-pr-opened", "ai-resume"],
+                    "open",
+                    updated_at="2026-01-01T00:00:00Z",
+                )
+            ]
 
         def view_issue(self, number: int):
             assert number == 77
-            return Issue(77, "Resume", "Issue body", ["ai-pr-opened", "ai-resume"], "open", updated_at="2026-01-01T00:00:00Z")
+            return Issue(
+                77,
+                "Resume",
+                "Issue body",
+                ["ai-pr-opened", "ai-resume"],
+                "open",
+                updated_at="2026-01-01T00:00:00Z",
+            )
 
         def blocked_by(self, number: int):
             return []
@@ -694,7 +951,10 @@ def test_run_once_dispatches_queued_resume(monkeypatch, tmp_path: Path):
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeRunOnceGH)
-    monkeypatch.setattr("ai_issue_worker.runner.check_dependencies", lambda config, root=None, paths=None: None)
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.check_dependencies",
+        lambda config, root=None, paths=None: None,
+    )
     monkeypatch.setattr("ai_issue_worker.runner.process_issue_resume", fake_resume)
 
     result = run_once(config_path)
@@ -706,13 +966,296 @@ def test_run_once_dispatches_queued_resume(monkeypatch, tmp_path: Path):
     assert captured["manual_note"] == ""
 
 
+def test_run_once_dispatches_parent_issue(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("repo: owner/repo\n", encoding="utf-8")
+    captured = {}
+
+    class FakeRunOnceParentGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def validate(self) -> None:
+            pass
+
+        def list_issues(self, labels):
+            return [
+                Issue(
+                    88,
+                    "Parent",
+                    "",
+                    ["ai-ready", "ai-parent"],
+                    "open",
+                    updated_at="2026-01-01T00:00:00Z",
+                )
+            ]
+
+        def view_issue(self, number: int):
+            return Issue(88, "Parent", "Parent body", ["ai-ready", "ai-parent"], "open")
+
+        def blocked_by(self, number: int):
+            return []
+
+    def fake_parent(config, plan, repo_root, paths):
+        captured["issue"] = plan.issue.number
+        captured["mode"] = plan.mode
+        return EXIT_OK
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeRunOnceParentGH)
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.check_dependencies",
+        lambda config, root=None, paths=None: None,
+    )
+    monkeypatch.setattr("ai_issue_worker.runner.process_parent_issue", fake_parent)
+
+    result = run_once(config_path)
+
+    assert result == EXIT_OK
+    assert captured == {"issue": 88, "mode": "parent"}
+
+
+def test_process_parent_issue_runs_up_to_configured_child_limit(
+    monkeypatch, tmp_path: Path
+):
+    config = config_from_dict(
+        {"repo": "owner/repo", "issue_selection": {"max_parent_children_per_run": 3}}
+    )
+    parent = Issue(50, "Parent", "Parent body", ["ai-ready", "ai-parent"], "open")
+    children = [
+        Issue(51, "Child 1", "Body 1", ["ai-child"], "open"),
+        Issue(52, "Child 2", "Body 2", ["ai-child"], "open"),
+        Issue(53, "Child 3", "Body 3", ["ai-child"], "open"),
+        Issue(54, "Child 4", "Body 4", ["ai-child"], "open"),
+    ]
+    paths = {
+        "run_root": tmp_path / ".ai-runs",
+        "worktree_root": tmp_path / ".ai-worktrees",
+    }
+    captured = {"processed": [], "removed": [], "added": []}
+
+    class FakeParentGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def add_label(self, number: int, label: str):
+            captured["added"].append((number, label))
+
+        def remove_label(self, number: int, label: str):
+            captured["removed"].append((number, label))
+
+        def comment(self, number: int, body_file: Path):
+            captured.setdefault("comments", []).append(
+                (number, body_file.read_text(encoding="utf-8"))
+            )
+
+        def sub_issues(self, number: int):
+            return children
+
+        def blocked_by(self, number: int):
+            return []
+
+    def fake_process_issue(config, plan, repo_root, paths, follow_up=""):
+        captured["processed"].append(plan.issue.number)
+        _write_pr_job(
+            paths["run_root"], plan.issue.number, f"ai/issue-{plan.issue.number}"
+        )
+        run_dir = paths["run_root"] / f"issue-{plan.issue.number}"
+        (run_dir / "summary.md").write_text(
+            f"Summary for {plan.issue.number}", encoding="utf-8"
+        )
+        return EXIT_OK
+
+    monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeParentGH)
+    monkeypatch.setattr("ai_issue_worker.runner.process_issue", fake_process_issue)
+
+    result = process_parent_issue(
+        config, IssueWorkPlan(parent, "main", mode="parent"), tmp_path, paths
+    )
+
+    assert result == EXIT_OK
+    assert captured["processed"] == [51, 52, 53]
+    assert (50, "ai-working") in captured["removed"]
+    record = load_job_record(paths["run_root"] / "issue-50" / "latest.json")
+    assert record.status == "parent_partial"
+
+
+def test_process_parent_issue_stops_on_child_failure(monkeypatch, tmp_path: Path):
+    config = config_from_dict({"repo": "owner/repo"})
+    parent = Issue(60, "Parent", "Parent body", ["ai-ready", "ai-parent"], "open")
+    child = Issue(61, "Child", "Body", ["ai-child"], "open")
+    paths = {
+        "run_root": tmp_path / ".ai-runs",
+        "worktree_root": tmp_path / ".ai-worktrees",
+    }
+    captured = {"added": [], "comments": []}
+
+    class FakeParentGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def add_label(self, number: int, label: str):
+            captured["added"].append((number, label))
+
+        def remove_label(self, number: int, label: str):
+            pass
+
+        def comment(self, number: int, body_file: Path):
+            captured["comments"].append(body_file.read_text(encoding="utf-8"))
+
+        def sub_issues(self, number: int):
+            return [child]
+
+        def blocked_by(self, number: int):
+            return []
+
+    monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeParentGH)
+    monkeypatch.setattr(
+        "ai_issue_worker.runner.process_issue", lambda *args, **kwargs: EXIT_VERIFY
+    )
+
+    result = process_parent_issue(
+        config, IssueWorkPlan(parent, "main", mode="parent"), tmp_path, paths
+    )
+
+    assert result == EXIT_VERIFY
+    assert (60, "ai-failed") in captured["added"]
+    assert "child issue #61 failed" in captured["comments"][-1]
+    record = load_job_record(paths["run_root"] / "issue-60" / "latest.json")
+    assert record.status == "parent_failed"
+
+
+def test_process_parent_issue_passes_parent_memory_to_later_children(
+    monkeypatch, tmp_path: Path
+):
+    config = config_from_dict({"repo": "owner/repo"})
+    parent = Issue(70, "Parent", "Parent body", ["ai-ready", "ai-parent"], "open")
+    children = [
+        Issue(71, "Child 1", "Body 1", ["ai-child"], "open"),
+        Issue(72, "Child 2", "Body 2", ["ai-child"], "open"),
+    ]
+    paths = {
+        "run_root": tmp_path / ".ai-runs",
+        "worktree_root": tmp_path / ".ai-worktrees",
+    }
+    follow_ups = []
+
+    class FakeParentGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def add_label(self, number: int, label: str):
+            pass
+
+        def remove_label(self, number: int, label: str):
+            pass
+
+        def comment(self, number: int, body_file: Path):
+            pass
+
+        def sub_issues(self, number: int):
+            return children
+
+        def blocked_by(self, number: int):
+            return []
+
+    def fake_process_issue(config, plan, repo_root, paths, follow_up=""):
+        follow_ups.append(follow_up)
+        _write_pr_job(
+            paths["run_root"], plan.issue.number, f"ai/issue-{plan.issue.number}"
+        )
+        run_dir = paths["run_root"] / f"issue-{plan.issue.number}"
+        (run_dir / "summary.md").write_text(
+            f"Summary for child {plan.issue.number}", encoding="utf-8"
+        )
+        return EXIT_OK
+
+    monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeParentGH)
+    monkeypatch.setattr("ai_issue_worker.runner.process_issue", fake_process_issue)
+
+    result = process_parent_issue(
+        config, IssueWorkPlan(parent, "main", mode="parent"), tmp_path, paths
+    )
+
+    assert result == EXIT_OK
+    assert "Parent body" in follow_ups[0]
+    assert "Child #71" in follow_ups[1]
+    assert "Summary for child 71" in follow_ups[1]
+
+
+def test_process_parent_issue_respects_stacked_pr_setting(monkeypatch, tmp_path: Path):
+    config = config_from_dict(
+        {"repo": "owner/repo", "issue_selection": {"allow_stacked_prs": False}}
+    )
+    parent = Issue(80, "Parent", "Parent body", ["ai-ready", "ai-parent"], "open")
+    blocker = Issue(81, "Blocker", "Body", ["ai-child"], "open")
+    dependent = Issue(82, "Dependent", "Body", ["ai-child"], "open")
+    paths = {
+        "run_root": tmp_path / ".ai-runs",
+        "worktree_root": tmp_path / ".ai-worktrees",
+    }
+    processed = []
+
+    class FakeParentGH:
+        def __init__(self, repo: str):
+            self.repo = repo
+
+        def add_label(self, number: int, label: str):
+            pass
+
+        def remove_label(self, number: int, label: str):
+            pass
+
+        def comment(self, number: int, body_file: Path):
+            pass
+
+        def sub_issues(self, number: int):
+            return [blocker, dependent]
+
+        def blocked_by(self, number: int):
+            return [blocker] if number == dependent.number else []
+
+    def fake_process_issue(config, plan, repo_root, paths, follow_up=""):
+        processed.append(plan.issue.number)
+        _write_pr_job(
+            paths["run_root"], plan.issue.number, f"ai/issue-{plan.issue.number}"
+        )
+        return EXIT_OK
+
+    monkeypatch.setattr("ai_issue_worker.runner.GHClient", FakeParentGH)
+    monkeypatch.setattr("ai_issue_worker.runner.process_issue", fake_process_issue)
+
+    result = process_parent_issue(
+        config, IssueWorkPlan(parent, "main", mode="parent"), tmp_path, paths
+    )
+
+    assert result == EXIT_OK
+    assert processed == [81]
+    record = load_job_record(paths["run_root"] / "issue-80" / "latest.json")
+    assert record.status == "parent_partial"
+
+
 def test_diff_snapshot_changes_when_untracked_file_content_changes(tmp_path: Path):
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
     (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
-    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "add", "tracked.txt"], cwd=tmp_path, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True
+    )
 
     untracked = tmp_path / "new.txt"
     untracked.write_text("before\n", encoding="utf-8")
@@ -725,12 +1268,29 @@ def test_diff_snapshot_changes_when_untracked_file_content_changes(tmp_path: Pat
 
 def test_diff_snapshot_changes_when_ignored_file_content_changes(tmp_path: Path):
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
     (tmp_path / ".gitignore").write_text(".env\nignored/\n", encoding="utf-8")
     (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
-    subprocess.run(["git", "add", ".gitignore", "tracked.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "add", ".gitignore", "tracked.txt"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True
+    )
 
     ignored = tmp_path / ".env"
     ignored.write_text("before\n", encoding="utf-8")

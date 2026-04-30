@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlparse
 
-from .models import DiscussionComment, Issue
+from .models import CreatedIssue, DiscussionComment, Issue
 from .privacy import sanitize_user_paths
 from .shell import run_cmd
 
@@ -33,7 +33,11 @@ class GHClient:
     def _run(self, args: list[str]):
         result = run_cmd(args)
         if result.exit_code != 0:
-            raise GHError(result.stderr.strip() or result.stdout.strip() or f"gh command failed: {result.command}")
+            raise GHError(
+                result.stderr.strip()
+                or result.stdout.strip()
+                or f"gh command failed: {result.command}"
+            )
         return result
 
     def _paginated_items(self, args: list[str]) -> list[dict]:
@@ -54,7 +58,22 @@ class GHClient:
         try:
             return int(parts[-1])
         except ValueError as exc:
-            raise GHError(f"could not parse pull request number from URL: {pr_url}") from exc
+            raise GHError(
+                f"could not parse pull request number from URL: {pr_url}"
+            ) from exc
+
+    @staticmethod
+    def _issue_number_from_url(issue_url: str) -> int:
+        path = urlparse(issue_url).path.rstrip("/")
+        parts = [part for part in path.split("/") if part]
+        if len(parts) < 2 or parts[-2] != "issues":
+            raise GHError(f"could not parse issue number from URL: {issue_url}")
+        try:
+            return int(parts[-1])
+        except ValueError as exc:
+            raise GHError(
+                f"could not parse issue number from URL: {issue_url}"
+            ) from exc
 
     @contextmanager
     def _sanitized_body_file(self, body_file: Path):
@@ -129,6 +148,58 @@ class GHClient:
         )
         return [Issue.from_gh(item) for item in items]
 
+    def sub_issues(self, number: int) -> list[Issue]:
+        hostname_args, repo_path = self._api_repo_args()
+        items = self._paginated_items(
+            [
+                "gh",
+                "api",
+                *hostname_args,
+                f"{repo_path}/issues/{number}/sub_issues",
+            ]
+        )
+        return [Issue.from_gh(item) for item in items]
+
+    def _issue_api_record(self, number: int) -> dict:
+        hostname_args, repo_path = self._api_repo_args()
+        result = self._run(
+            ["gh", "api", *hostname_args, f"{repo_path}/issues/{number}"]
+        )
+        data = json.loads(result.stdout or "{}")
+        if not isinstance(data, dict) or not data.get("id"):
+            raise GHError(f"could not load GitHub issue API id for issue #{number}")
+        return data
+
+    def add_sub_issue(self, parent_number: int, child_issue_id: int) -> None:
+        hostname_args, repo_path = self._api_repo_args()
+        self._run(
+            [
+                "gh",
+                "api",
+                *hostname_args,
+                "-X",
+                "POST",
+                f"{repo_path}/issues/{parent_number}/sub_issues",
+                "-f",
+                f"sub_issue_id={child_issue_id}",
+            ]
+        )
+
+    def add_blocked_by(self, issue_number: int, blocking_issue_id: int) -> None:
+        hostname_args, repo_path = self._api_repo_args()
+        self._run(
+            [
+                "gh",
+                "api",
+                *hostname_args,
+                "-X",
+                "POST",
+                f"{repo_path}/issues/{issue_number}/dependencies/blocked_by",
+                "-f",
+                f"issue_id={blocking_issue_id}",
+            ]
+        )
+
     def issue_comments(self, number: int) -> list[DiscussionComment]:
         hostname_args, repo_path = self._api_repo_args()
         items = self._paginated_items(
@@ -152,7 +223,9 @@ class GHClient:
                 f"{repo_path}/pulls/{pr_number}/comments",
             ]
         )
-        return [DiscussionComment.from_gh(item, "pull request comment") for item in items]
+        return [
+            DiscussionComment.from_gh(item, "pull request comment") for item in items
+        ]
 
     def pr_reviews(self, pr_url: str) -> list[DiscussionComment]:
         hostname_args, repo_path = self._api_repo_args()
@@ -165,13 +238,39 @@ class GHClient:
                 f"{repo_path}/pulls/{pr_number}/reviews",
             ]
         )
-        return [DiscussionComment.from_gh(item, "pull request review") for item in items if item.get("body")]
+        return [
+            DiscussionComment.from_gh(item, "pull request review")
+            for item in items
+            if item.get("body")
+        ]
 
     def add_label(self, number: int, label: str) -> None:
-        self._run(["gh", "issue", "edit", str(number), "--repo", self.repo, "--add-label", label])
+        self._run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                str(number),
+                "--repo",
+                self.repo,
+                "--add-label",
+                label,
+            ]
+        )
 
     def remove_label(self, number: int, label: str) -> None:
-        self._run(["gh", "issue", "edit", str(number), "--repo", self.repo, "--remove-label", label])
+        self._run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                str(number),
+                "--repo",
+                self.repo,
+                "--remove-label",
+                label,
+            ]
+        )
 
     def ensure_label(self, name: str, color: str, description: str) -> None:
         self._run(
@@ -196,9 +295,27 @@ class GHClient:
 
     def comment(self, number: int, body_file: Path) -> None:
         with self._sanitized_body_file(body_file) as sanitized:
-            self._run(["gh", "issue", "comment", str(number), "--repo", self.repo, "--body-file", str(sanitized)])
+            self._run(
+                [
+                    "gh",
+                    "issue",
+                    "comment",
+                    str(number),
+                    "--repo",
+                    self.repo,
+                    "--body-file",
+                    str(sanitized),
+                ]
+            )
 
-    def create_issue(self, title: str, body_file: Path, labels: list[str] | None = None) -> str:
+    def create_issue(
+        self, title: str, body_file: Path, labels: list[str] | None = None
+    ) -> str:
+        return self.create_issue_record(title, body_file, labels).url
+
+    def create_issue_record(
+        self, title: str, body_file: Path, labels: list[str] | None = None
+    ) -> CreatedIssue:
         args = [
             "gh",
             "issue",
@@ -215,7 +332,16 @@ class GHClient:
         with self._sanitized_body_file(body_file) as sanitized:
             args[body_index + 1] = str(sanitized)
             result = self._run(args)
-        return result.stdout.strip().splitlines()[-1]
+        url = result.stdout.strip().splitlines()[-1]
+        number = self._issue_number_from_url(url)
+        data = self._issue_api_record(number)
+        issue = Issue.from_gh(data)
+        return CreatedIssue(
+            number=number,
+            title=issue.title or title,
+            url=url,
+            id=issue.id or int(data["id"]),
+        )
 
     def create_pr(
         self,

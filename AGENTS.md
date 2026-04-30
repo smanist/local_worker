@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This repository is a local automation worker that turns GitHub issues into draft pull requests. The main loop is:
+This repository is a local automation worker that turns GitHub issues into draft pull requests. The normal single-issue loop is:
 
 1. Select one `ai-ready` issue from GitHub.
 2. Create an isolated git worktree and branch.
@@ -10,6 +10,12 @@ This repository is a local automation worker that turns GitHub issues into draft
 4. Run verifier commands and limited repair attempts.
 5. Run a separate Codex review loop and fix blocking findings.
 6. Enforce diff policy, commit, push, and open a draft PR.
+
+For larger requests, `ai-issue create --mode parent` can create a schedulable
+parent issue with GitHub sub-issues and native `blocked_by` dependency edges.
+When the worker selects an `ai-ready` + `ai-parent` issue, it orchestrates
+eligible child issues serially. Each child still gets its own worktree, Codex
+session, verification/review loop, commit, push, and draft PR.
 
 The repo is intentionally small. Most behavior lives in `src/ai_issue_worker/runner.py` and `src/ai_issue_worker/cli.py`.
 
@@ -32,6 +38,7 @@ The repo is intentionally small. Most behavior lives in `src/ai_issue_worker/run
 - Local state lives under `.ai-worktrees`, `.ai-runs`, `.ai-logs`, and `.ai-runtime`.
 - The worker uses filesystem artifacts as its audit trail. Each issue gets a run directory under `.ai-runs/issue-<n>/`.
 - Successful PR open/update flows also write a local `summary.md` artifact for future resume runs.
+- Parent runs write `parent-plan.json` and `parent-memory.md` in the parent run directory to carry durable context across child Codex sessions.
 - `latest.json`, `prompt.md`, `verify.log`, `review.md`, `summary.md`, `pr_body.md`, and `codex.log` are convenience pointers to the newest timestamped artifacts.
 - The worker lock is `.ai-runtime/worker.lock`. Daemon status is `.ai-runtime/worker.status.json`.
 
@@ -42,6 +49,8 @@ The repo is intentionally small. Most behavior lives in `src/ai_issue_worker/run
 - The outer worker commits and pushes. Prompts explicitly instruct the inner Codex session not to do that.
 - Resume runs for existing PRs must update the existing PR and recorded branch/worktree instead of silently opening a second PR.
 - Queued resume runs are selected via the `ai-resume` label and should stay distinct from fresh `ai-ready` issue work.
+- Parent issues are orchestration-only; child issues are the code-producing PR units.
+- Parent runs process children serially and must respect the existing stacked PR settings for open blockers.
 - GitHub comments, issue bodies, and PR bodies must be sanitized before leaving the machine.
 - Diff policy is enforced after implementation and review loops succeed. Do not bypass it accidentally.
 - `allow_dirty_base` only tolerates worker-owned runtime paths unless explicitly configured otherwise.

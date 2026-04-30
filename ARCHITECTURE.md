@@ -12,7 +12,7 @@ The codebase is structured as a thin set of adapters around one orchestrator. Th
 
 ## End-to-End Flow
 
-`ai-issue run-once` calls `runner.run_once()`, which performs these steps:
+`ai-issue run-once` calls `runner.run_once()`, which performs these steps for a normal issue:
 
 1. Load and validate config.
 2. Resolve worker paths relative to the repo root.
@@ -27,6 +27,13 @@ The codebase is structured as a thin set of adapters around one orchestrator. Th
 11. Inspect the final diff against diff-policy limits.
 12. Commit, push, create a draft PR, label the issue, comment success, and optionally remove the worktree.
 
+If the selected issue has the configured parent label, `runner.run_once()`
+dispatches to parent orchestration instead. A parent run loads GitHub sub-issues,
+writes a `parent-plan.json` DAG snapshot, then processes eligible children
+serially through the same normal issue pipeline. Each child produces its own
+branch and draft PR. The parent run appends `parent-memory.md` after each child
+so later child prompts receive prior summaries, PR URLs, and preserved decisions.
+
 `ai-issue start` runs the same `run_once()` loop inside `daemon.daemon_loop()`. The daemon itself is intentionally simple: PID file, status file, and a sleep loop.
 
 ## Main Control Surfaces
@@ -35,6 +42,7 @@ The codebase is structured as a thin set of adapters around one orchestrator. Th
 
 - Parses subcommands.
 - Handles config bootstrapping in `init`.
+- Drafts single or parent/sub-issue plans in `create`, including `--mode auto|single|parent`.
 - Exposes manual/operator commands such as `inspect`, `retry`, `resume`, and `clean`.
 - Starts or stops the daemon.
 - Delegates all issue execution to `runner.run_once()`.
@@ -46,6 +54,7 @@ This is the repo's center of gravity.
 - Defines worker exit codes.
 - Applies model/reasoning overrides.
 - Computes workable issue plans, including stacked PR base-branch selection.
+- Dispatches parent issues to serial child orchestration while preserving one PR per child issue.
 - Builds prompts and invokes Codex sessions.
 - Runs verifier and review/fix loops.
 - Generates a best-effort resume summary artifact after successful PR creation or update.
@@ -97,6 +106,8 @@ The filesystem is the operational state store:
 Per-issue run directories contain both timestamped files and latest aliases. Common artifacts:
 
 - `run-<stamp>.json` and `latest.json`
+- `parent-plan-<stamp>.json` and `parent-plan.json` for parent DAG snapshots
+- `parent-memory-<stamp>.md` and `parent-memory.md` for parent context carried between child runs
 - `prompt-<stamp>.md` and `prompt.md`
 - `codex-<stamp>.log` and `codex.log`
 - `verify-<stamp>.log` and `verify.log`

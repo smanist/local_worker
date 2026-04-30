@@ -35,11 +35,17 @@ class IssueSelectionConfig:
     working_label: str = "ai-working"
     failed_label: str = "ai-failed"
     pr_opened_label: str = "ai-pr-opened"
-    blocked_labels: list[str] = field(default_factory=lambda: ["blocked", "needs-human"])
+    parent_label: str = "ai-parent"
+    child_label: str = "ai-child"
+    parent_done_label: str = "ai-parent-done"
+    blocked_labels: list[str] = field(
+        default_factory=lambda: ["blocked", "needs-human"]
+    )
     respect_issue_dependencies: bool = True
     allow_stacked_prs: bool = False
     max_stack_depth: int = 3
     max_issues_per_run: int = 1
+    max_parent_children_per_run: int = 3
     selection_order: str = "oldest_updated"
 
 
@@ -74,7 +80,12 @@ class ReviewConfig:
 @dataclass
 class VerifyConfig:
     commands: list[str] = field(
-        default_factory=lambda: ["ruff check .", "ruff format --check .", "pyright", "pytest"]
+        default_factory=lambda: [
+            "ruff check .",
+            "ruff format --check .",
+            "pyright",
+            "pytest",
+        ]
     )
     run_all_commands: bool = True
 
@@ -83,7 +94,9 @@ class VerifyConfig:
 class DiffPolicyConfig:
     max_changed_files: int = 30
     max_diff_lines: int = 2000
-    reject_paths: list[str] = field(default_factory=lambda: [".env", ".secrets", "**/*.pem", "**/*.key"])
+    reject_paths: list[str] = field(
+        default_factory=lambda: [".env", ".secrets", "**/*.pem", "**/*.key"]
+    )
     allow_lockfile_changes: bool = False
 
 
@@ -129,7 +142,9 @@ def _merge(default: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def default_config_dict(repo: str = "owner/repo", base_branch: str = "main") -> dict[str, Any]:
+def default_config_dict(
+    repo: str = "owner/repo", base_branch: str = "main"
+) -> dict[str, Any]:
     return {
         "repo": repo,
         "base_branch": base_branch,
@@ -175,7 +190,15 @@ def config_from_dict(data: dict[str, Any]) -> WorkerConfig:
         raise ConfigError("review.max_iterations must be at least 1")
     if config.issue_selection.max_stack_depth < 1:
         raise ConfigError("issue_selection.max_stack_depth must be at least 1")
-    invalid_priorities = [priority for priority in config.review.fix_priorities if priority not in {"P0", "P1"}]
+    if config.issue_selection.max_parent_children_per_run < 1:
+        raise ConfigError(
+            "issue_selection.max_parent_children_per_run must be at least 1"
+        )
+    invalid_priorities = [
+        priority
+        for priority in config.review.fix_priorities
+        if priority not in {"P0", "P1"}
+    ]
     if invalid_priorities:
         raise ConfigError("review.fix_priorities must contain only P0 or P1")
     return config
@@ -194,9 +217,13 @@ def load_config(path: Path) -> WorkerConfig:
 def default_config_text(repo: str = "owner/repo", base_branch: str = "main") -> str:
     data = default_config_dict(repo=repo, base_branch=base_branch)
     body = yaml.safe_dump(data, sort_keys=False)
-    repo_comment = "# Repo and base_branch were inferred from local git when possible.\n"
+    repo_comment = (
+        "# Repo and base_branch were inferred from local git when possible.\n"
+    )
     if repo == "owner/repo":
-        repo_comment = "# Replace repo with the target GitHub repository in owner/repo form.\n"
+        repo_comment = (
+            "# Replace repo with the target GitHub repository in owner/repo form.\n"
+        )
     return (
         "# Local AI Issue Worker configuration\n"
         f"{repo_comment}"
@@ -205,7 +232,11 @@ def default_config_text(repo: str = "owner/repo", base_branch: str = "main") -> 
     )
 
 
-def write_default_config(path: Path, force: bool = False, repo: str = "owner/repo", base_branch: str = "main") -> None:
+def write_default_config(
+    path: Path, force: bool = False, repo: str = "owner/repo", base_branch: str = "main"
+) -> None:
     if path.exists() and not force:
         raise ConfigError(f"config already exists: {path}; use --force to overwrite")
-    path.write_text(default_config_text(repo=repo, base_branch=base_branch), encoding="utf-8")
+    path.write_text(
+        default_config_text(repo=repo, base_branch=base_branch), encoding="utf-8"
+    )

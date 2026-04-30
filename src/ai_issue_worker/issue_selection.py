@@ -10,6 +10,7 @@ def excluded_labels(config: IssueSelectionConfig) -> set[str]:
         config.failed_label,
         config.pr_opened_label,
         config.resume_label,
+        config.parent_done_label,
         *config.blocked_labels,
     }
 

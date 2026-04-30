@@ -16,8 +16,25 @@ class Result:
 def test_blocked_by_uses_gh_api_and_flattens_paginated_results(monkeypatch):
     captured = {}
     pages = [
-        [{"number": 2, "title": "Open blocker", "body": "", "labels": [], "state": "open", "updated_at": "2026-01-01"}],
-        [{"number": 3, "title": "Closed blocker", "body": "", "labels": [], "state": "closed"}],
+        [
+            {
+                "number": 2,
+                "title": "Open blocker",
+                "body": "",
+                "labels": [],
+                "state": "open",
+                "updated_at": "2026-01-01",
+            }
+        ],
+        [
+            {
+                "number": 3,
+                "title": "Closed blocker",
+                "body": "",
+                "labels": [],
+                "state": "closed",
+            }
+        ],
     ]
 
     def fake_run_cmd(args):
@@ -55,6 +72,115 @@ def test_blocked_by_passes_hostname_for_hosted_repo(monkeypatch):
         "--hostname",
         "github.example.com",
         "repos/owner/repo/issues/1/dependencies/blocked_by",
+    ]
+
+
+def test_create_issue_record_loads_rest_id(monkeypatch, tmp_path: Path):
+    captured = []
+    body = tmp_path / "body.md"
+    body.write_text("Body\n", encoding="utf-8")
+
+    def fake_run_cmd(args):
+        captured.append(args)
+        if args[:3] == ["gh", "issue", "create"]:
+            return Result("https://github.com/owner/repo/issues/42\n")
+        return Result(
+            json.dumps(
+                {
+                    "id": 9001,
+                    "number": 42,
+                    "title": "Title",
+                    "body": "Body",
+                    "labels": [],
+                    "state": "open",
+                }
+            )
+        )
+
+    monkeypatch.setattr("ai_issue_worker.github_gh.run_cmd", fake_run_cmd)
+
+    issue = GHClient("owner/repo").create_issue_record(
+        "Title", body, labels=["ai-ready"]
+    )
+
+    assert issue.number == 42
+    assert issue.id == 9001
+    assert captured[1] == ["gh", "api", "repos/owner/repo/issues/42"]
+
+
+def test_sub_issues_uses_gh_api_and_flattens_paginated_results(monkeypatch):
+    captured = {}
+
+    def fake_run_cmd(args):
+        captured["args"] = args
+        return Result(
+            json.dumps(
+                [
+                    [
+                        {
+                            "id": 8,
+                            "number": 2,
+                            "title": "Child",
+                            "body": "",
+                            "labels": [],
+                            "state": "open",
+                        }
+                    ]
+                ]
+            )
+        )
+
+    monkeypatch.setattr("ai_issue_worker.github_gh.run_cmd", fake_run_cmd)
+
+    children = GHClient("owner/repo").sub_issues(1)
+
+    assert captured["args"] == [
+        "gh",
+        "api",
+        "repos/owner/repo/issues/1/sub_issues",
+        "--paginate",
+        "--slurp",
+    ]
+    assert children[0].number == 2
+    assert children[0].id == 8
+
+
+def test_add_sub_issue_and_dependency_use_rest_ids(monkeypatch):
+    captured = []
+
+    def fake_run_cmd(args):
+        captured.append(args)
+        return Result("{}")
+
+    monkeypatch.setattr("ai_issue_worker.github_gh.run_cmd", fake_run_cmd)
+
+    gh = GHClient("github.example.com/owner/repo")
+    gh.add_sub_issue(10, 1001)
+    gh.add_blocked_by(11, 1002)
+
+    assert captured == [
+        [
+            "gh",
+            "api",
+            "--hostname",
+            "github.example.com",
+            "-X",
+            "POST",
+            "repos/owner/repo/issues/10/sub_issues",
+            "-f",
+            "sub_issue_id=1001",
+        ],
+        [
+            "gh",
+            "api",
+            "--hostname",
+            "github.example.com",
+            "-X",
+            "POST",
+            "repos/owner/repo/issues/11/dependencies/blocked_by",
+            "-f",
+            "issue_id=1002",
+        ],
     ]
 
 
@@ -107,7 +233,9 @@ def test_ensure_labels_creates_or_updates_each_label(monkeypatch):
 def test_create_pr_sanitizes_body_file_before_pushing(monkeypatch, tmp_path: Path):
     captured = {}
     body = tmp_path / "body.md"
-    body.write_text("Verifier failed in /Users/alice/Repos/project/src/app.py\n", encoding="utf-8")
+    body.write_text(
+        "Verifier failed in /Users/alice/Repos/project/src/app.py\n", encoding="utf-8"
+    )
 
     def fake_run_cmd(args):
         body_path = Path(args[args.index("--body-file") + 1])
@@ -130,7 +258,19 @@ def test_issue_comments_uses_issue_comments_api(monkeypatch):
 
     def fake_run_cmd(args):
         captured["args"] = args
-        return Result(json.dumps([[{"body": "Please fix", "created_at": "2026-01-01T00:00:00Z", "user": {"login": "alice"}}]]))
+        return Result(
+            json.dumps(
+                [
+                    [
+                        {
+                            "body": "Please fix",
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "user": {"login": "alice"},
+                        }
+                    ]
+                ]
+            )
+        )
 
     monkeypatch.setattr("ai_issue_worker.github_gh.run_cmd", fake_run_cmd)
 
@@ -154,7 +294,19 @@ def test_pr_reviews_uses_reviews_api(monkeypatch):
 
     def fake_run_cmd(args):
         captured["args"] = args
-        return Result(json.dumps([[{"body": "Needs another test", "submitted_at": "2026-01-02T00:00:00Z", "user": {"login": "bob"}}]]))
+        return Result(
+            json.dumps(
+                [
+                    [
+                        {
+                            "body": "Needs another test",
+                            "submitted_at": "2026-01-02T00:00:00Z",
+                            "user": {"login": "bob"},
+                        }
+                    ]
+                ]
+            )
+        )
 
     monkeypatch.setattr("ai_issue_worker.github_gh.run_cmd", fake_run_cmd)
 
@@ -176,7 +328,9 @@ def test_pr_reviews_uses_reviews_api(monkeypatch):
 def test_update_pr_sanitizes_body_file_before_edit(monkeypatch, tmp_path: Path):
     captured = {}
     body = tmp_path / "body.md"
-    body.write_text("Updated in /Users/alice/Repos/project/src/app.py\n", encoding="utf-8")
+    body.write_text(
+        "Updated in /Users/alice/Repos/project/src/app.py\n", encoding="utf-8"
+    )
 
     def fake_run_cmd(args):
         body_path = Path(args[args.index("--body-file") + 1])
@@ -186,7 +340,9 @@ def test_update_pr_sanitizes_body_file_before_edit(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr("ai_issue_worker.github_gh.run_cmd", fake_run_cmd)
 
-    GHClient("owner/repo").update_pr("https://github.com/owner/repo/pull/2", "Updated Title", body)
+    GHClient("owner/repo").update_pr(
+        "https://github.com/owner/repo/pull/2", "Updated Title", body
+    )
 
     assert captured["args"][:6] == [
         "gh",

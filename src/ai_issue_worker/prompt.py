@@ -29,10 +29,16 @@ def repository_instructions(repo_root: Path) -> str:
             snippet = text if limit is None else text[:limit]
             parts.append(f"## {name}\n\n{snippet.strip()}")
     joined = "\n\n".join(parts).strip()
-    return joined[:MAX_INSTRUCTION_CHARS] if joined else "No repository instruction files were found."
+    return (
+        joined[:MAX_INSTRUCTION_CHARS]
+        if joined
+        else "No repository instruction files were found."
+    )
 
 
-def build_prompt(issue: Issue, config: WorkerConfig, repo_root: Path, follow_up: str = "") -> str:
+def build_prompt(
+    issue: Issue, config: WorkerConfig, repo_root: Path, follow_up: str = ""
+) -> str:
     verify_commands = "\n".join(f"- `{command}`" for command in config.verify.commands)
     follow_up_section = ""
     if follow_up.strip():
@@ -83,13 +89,24 @@ A modified working tree that addresses the issue.
 """
 
 
-def build_issue_draft_prompt(description: str, repo_root: Path, config: WorkerConfig, title_hint: str | None = None) -> str:
+def build_issue_draft_prompt(
+    description: str,
+    repo_root: Path,
+    config: WorkerConfig,
+    title_hint: str | None = None,
+    mode: str = "auto",
+) -> str:
     title_note = f"- Title hint: {title_hint}\n" if title_hint else ""
+    mode_note = {
+        "auto": "Choose `single` for small localized work. Choose `parent` when the work naturally needs multiple dependent issues.",
+        "single": "Return `single`; do not split the request into sub-issues.",
+        "parent": "Return `parent`; split the request into a parent tracking issue and implementation sub-issues.",
+    }.get(mode, "Choose the most appropriate issue shape.")
     return f"""# Task
 
 You are drafting a GitHub issue for repository `{config.repo}` from rough local notes.
 
-Turn the rough notes into a concise, implementation-ready GitHub issue.
+Turn the rough notes into concise, implementation-ready GitHub issue content.
 
 ## Rough notes
 
@@ -98,13 +115,18 @@ Turn the rough notes into a concise, implementation-ready GitHub issue.
 ## Requirements
 
 - Return only valid JSON. Do not wrap it in markdown fences.
-- The JSON object must contain exactly two string fields: `title` and `body`.
-- Output shape: {{"title": "...", "body": "..."}}
+- Create mode: `{mode}`.
+- {mode_note}
+- For a single issue, output shape: {{"kind": "single", "issue": {{"title": "...", "body": "..."}}}}
+- For a parent issue, output shape: {{"kind": "parent", "parent": {{"title": "...", "body": "..."}}, "children": [{{"key": "...", "title": "...", "body": "...", "blocked_by": ["..."]}}]}}
 - `title` should be concise and specific.
-- `body` must be GitHub-flavored Markdown without a top-level title heading.
-- Make the issue concrete enough for an engineering agent to act on.
+- `body` values must be GitHub-flavored Markdown without a top-level title heading.
+- Make every implementation issue concrete enough for an engineering agent to act on.
+- Parent issues should describe the overall goal, dependency graph, and shared context.
+- Child issue `key` values must be unique stable slugs.
+- Child `blocked_by` entries must reference other child keys only.
 - Preserve uncertainty explicitly instead of inventing facts.
-- Keep the body focused and not verbose.
+- Keep bodies focused and not verbose.
 {title_note}
 ## Desired body structure
 
@@ -120,7 +142,9 @@ Turn the rough notes into a concise, implementation-ready GitHub issue.
 """
 
 
-def build_repair_prompt(issue: Issue, verify_logs: str, diff_summary: DiffSummary) -> str:
+def build_repair_prompt(
+    issue: Issue, verify_logs: str, diff_summary: DiffSummary
+) -> str:
     return f"""# Repair task
 
 Your previous attempt to fix GitHub issue #{issue.number} did not pass verification.
@@ -145,12 +169,20 @@ Do not commit changes.
 """
 
 
-def build_review_prompt(issue: Issue, config: WorkerConfig, repo_root: Path, diff_summary: DiffSummary, verify: VerifyResult) -> str:
+def build_review_prompt(
+    issue: Issue,
+    config: WorkerConfig,
+    repo_root: Path,
+    diff_summary: DiffSummary,
+    verify: VerifyResult,
+) -> str:
     blocking = ", ".join(config.review.fix_priorities)
     blocking_examples = list(config.review.fix_priorities)
     if len(config.review.fix_priorities) > 1:
         blocking_examples.append(",".join(config.review.fix_priorities))
-    output_examples = "\nor\n".join(f"`BLOCKING_PRIORITIES: {priority}`" for priority in blocking_examples)
+    output_examples = "\nor\n".join(
+        f"`BLOCKING_PRIORITIES: {priority}`" for priority in blocking_examples
+    )
     return f"""# Code review task
 
 You are a separate Codex code-review session for repository `{config.repo}`.

@@ -10,23 +10,58 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
-from .config import DEFAULT_CONFIG_PATH, REASONING_EFFORTS, ConfigError, load_config, write_default_config
+from .config import (
+    DEFAULT_CONFIG_PATH,
+    REASONING_EFFORTS,
+    ConfigError,
+    load_config,
+    write_default_config,
+)
 from .codex_backend import CodexBackend
 from .daemon import pid_alive, read_json, write_status
 from .github_gh import GHClient, GHError
 from .jobs import issue_run_dir, recent_jobs
 from .locking import lock_status
 from .prompt import build_issue_draft_prompt
-from .runner import RunOverrides, configured_paths, resume_issue, run_once, workable_issues
+from .runner import (
+    RunOverrides,
+    configured_paths,
+    resume_issue,
+    run_once,
+    workable_issues,
+)
 from .shell import run_cmd
 from .worktree import GitError, remove_worktree
 
 
 AI_ISSUE_GITIGNORE_ENTRIES = [".ai-logs", ".ai-runs", ".ai-runtime", ".ai-worktrees"]
+CREATE_MODES = ("auto", "single", "parent")
+
+
+@dataclass(frozen=True)
+class IssueDraft:
+    title: str
+    body: str
+
+
+@dataclass(frozen=True)
+class ChildIssueDraft(IssueDraft):
+    key: str
+    blocked_by: list[str]
+
+
+@dataclass(frozen=True)
+class IssueDraftPlan:
+    kind: str
+    issue: IssueDraft | None = None
+    parent: IssueDraft | None = None
+    children: list[ChildIssueDraft] | None = None
 
 
 def parse_interval_minutes(value: str) -> int:
@@ -106,7 +141,9 @@ def _infer_repo_from_git() -> str | None:
 
 
 def _infer_base_branch_from_git() -> str | None:
-    origin_head = _git_stdout(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+    origin_head = _git_stdout(
+        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"]
+    )
     if origin_head:
         return origin_head.removeprefix("origin/")
     current = _git_stdout(["git", "branch", "--show-current"])
@@ -125,12 +162,47 @@ def _automation_label_specs(config) -> dict[str, tuple[str, str]]:
 
     labels = config.issue_selection
     add(labels.ready_label, "0E8A16", "Ready for the local AI issue worker to process.")
-    add(labels.resume_label, "FB8C00", "Queue a follow-up pass on an existing AI issue worker pull request.")
-    add(labels.working_label, "1D76DB", "Currently being processed by the local AI issue worker.")
-    add(labels.failed_label, "D73A4A", "The local AI issue worker failed to complete this issue.")
-    add(labels.pr_opened_label, "5319E7", "The local AI issue worker opened a pull request for this issue.")
+    add(
+        labels.resume_label,
+        "FB8C00",
+        "Queue a follow-up pass on an existing AI issue worker pull request.",
+    )
+    add(
+        labels.working_label,
+        "1D76DB",
+        "Currently being processed by the local AI issue worker.",
+    )
+    add(
+        labels.failed_label,
+        "D73A4A",
+        "The local AI issue worker failed to complete this issue.",
+    )
+    add(
+        labels.pr_opened_label,
+        "5319E7",
+        "The local AI issue worker opened a pull request for this issue.",
+    )
+    add(
+        labels.parent_label,
+        "6F42C1",
+        "Parent tracking issue for local AI issue worker sub-issue orchestration.",
+    )
+    add(
+        labels.child_label,
+        "0969DA",
+        "Sub-issue owned by a local AI issue worker parent issue.",
+    )
+    add(
+        labels.parent_done_label,
+        "8250DF",
+        "Parent issue orchestration has opened all available child pull requests.",
+    )
     for label in labels.blocked_labels:
-        add(label, "FBCA04", "Blocked from local AI issue worker selection until human action is taken.")
+        add(
+            label,
+            "FBCA04",
+            "Blocked from local AI issue worker selection until human action is taken.",
+        )
     return specs
 
 
@@ -175,7 +247,94 @@ def _strip_code_fence(text: str) -> str:
     return stripped
 
 
-def _parse_issue_draft_json(text: str) -> tuple[str, str]:
+def _draft_item(data: Any, context: str) -> IssueDraft:
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{context} must be an object")
+    title = data.get("title")
+    body = data.get("body")
+    if not isinstance(title, str) or not title.strip():
+        raise RuntimeError(f"{context} title is empty")
+    if not isinstance(body, str) or not body.strip():
+        raise RuntimeError(f"{context} body is empty")
+    return IssueDraft(title.strip(), body.strip())
+
+
+def _child_draft_item(data: Any) -> ChildIssueDraft:
+    draft = _draft_item(data, "child issue")
+    key = data.get("key") if isinstance(data, dict) else None
+    blocked_by = data.get("blocked_by", []) if isinstance(data, dict) else []
+    if not isinstance(key, str) or not key.strip():
+        raise RuntimeError("child issue key is empty")
+    if not isinstance(blocked_by, list) or any(
+        not isinstance(item, str) for item in blocked_by
+    ):
+        raise RuntimeError(
+            f"child issue `{key}` blocked_by must be a list of child keys"
+        )
+    return ChildIssueDraft(
+        draft.title,
+        draft.body,
+        key.strip(),
+        [item.strip() for item in blocked_by if item.strip()],
+    )
+
+
+def _validate_acyclic_children(children: list[ChildIssueDraft]) -> None:
+    keys = [child.key for child in children]
+    if len(set(keys)) != len(keys):
+        raise RuntimeError("parent issue children must have unique keys")
+    key_set = set(keys)
+    for child in children:
+        missing = [key for key in child.blocked_by if key not in key_set]
+        if missing:
+            raise RuntimeError(
+                f"child issue `{child.key}` references unknown blocked_by key(s): {', '.join(missing)}"
+            )
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    edges = {child.key: child.blocked_by for child in children}
+
+    def visit(key: str) -> None:
+        if key in visited:
+            return
+        if key in visiting:
+            raise RuntimeError("parent issue dependency graph must be acyclic")
+        visiting.add(key)
+        for blocker in edges[key]:
+            visit(blocker)
+        visiting.remove(key)
+        visited.add(key)
+
+    for key in keys:
+        visit(key)
+
+
+def _validate_draft_plan(plan: IssueDraftPlan, requested_mode: str) -> IssueDraftPlan:
+    if plan.kind not in {"single", "parent"}:
+        raise RuntimeError("issue draft kind must be `single` or `parent`")
+    if requested_mode == "single" and plan.kind != "single":
+        raise RuntimeError(
+            "agent returned a parent issue plan while --mode single was requested"
+        )
+    if requested_mode == "parent" and plan.kind != "parent":
+        raise RuntimeError(
+            "agent returned a single issue plan while --mode parent was requested"
+        )
+    if plan.kind == "single":
+        if plan.issue is None:
+            raise RuntimeError("single issue draft is missing issue content")
+        return plan
+    children = plan.children or []
+    if plan.parent is None:
+        raise RuntimeError("parent issue draft is missing parent content")
+    if not children:
+        raise RuntimeError("parent issue draft must contain at least one child issue")
+    _validate_acyclic_children(children)
+    return plan
+
+
+def _parse_issue_draft_json(text: str, requested_mode: str = "auto") -> IssueDraftPlan:
     stripped = _strip_code_fence(text)
     candidates = [stripped]
     start = stripped.find("{")
@@ -189,11 +348,30 @@ def _parse_issue_draft_json(text: str) -> tuple[str, str]:
             continue
         if not isinstance(data, dict):
             continue
-        title = data.get("title")
-        body = data.get("body")
-        if isinstance(title, str) and isinstance(body, str):
-            return title.strip(), body.strip()
+        if isinstance(data.get("title"), str) and isinstance(data.get("body"), str):
+            plan = IssueDraftPlan("single", issue=_draft_item(data, "issue"))
+            return _validate_draft_plan(plan, requested_mode)
+        kind = data.get("kind")
+        if kind == "single":
+            plan = IssueDraftPlan(
+                "single", issue=_draft_item(data.get("issue"), "issue")
+            )
+            return _validate_draft_plan(plan, requested_mode)
+        if kind == "parent":
+            raw_children = data.get("children")
+            if not isinstance(raw_children, list):
+                raise RuntimeError("parent issue draft children must be a list")
+            plan = IssueDraftPlan(
+                "parent",
+                parent=_draft_item(data.get("parent"), "parent issue"),
+                children=[_child_draft_item(item) for item in raw_children],
+            )
+            return _validate_draft_plan(plan, requested_mode)
     raise RuntimeError("agent did not return valid issue draft JSON")
+
+
+def _render_issue_plan_json(plan: IssueDraftPlan) -> str:
+    return json.dumps(asdict(plan), indent=2, sort_keys=False) + "\n"
 
 
 def _render_issue_draft(title: str, body: str) -> str:
@@ -223,6 +401,72 @@ def _parse_issue_draft_file(text: str) -> tuple[str, str]:
     if not body:
         raise ConfigError("issue body is empty after editing; aborting")
     return title, body
+
+
+def _body_file(path: Path, body: str) -> Path:
+    path.write_text(f"{body.strip()}\n", encoding="utf-8")
+    return path
+
+
+def _create_single_issue(
+    config, gh: GHClient, draft_file: Path, plan: IssueDraftPlan, args
+) -> str:
+    assert plan.issue is not None
+    draft_file.write_text(
+        _render_issue_draft(plan.issue.title, plan.issue.body), encoding="utf-8"
+    )
+    if not args.no_edit:
+        _run_editor(draft_file, args.editor)
+    edited_title, edited_body = _parse_issue_draft_file(
+        draft_file.read_text(encoding="utf-8")
+    )
+    draft_file.write_text(f"{edited_body}\n", encoding="utf-8")
+    return gh.create_issue(
+        edited_title,
+        draft_file,
+        labels=[config.issue_selection.ready_label],
+    )
+
+
+def _create_parent_issue(
+    config, gh: GHClient, draft_file: Path, draft_dir: Path, plan: IssueDraftPlan, args
+) -> str:
+    draft_file.write_text(_render_issue_plan_json(plan), encoding="utf-8")
+    if not args.no_edit:
+        _run_editor(draft_file, args.editor)
+    edited_plan = _parse_issue_draft_json(
+        draft_file.read_text(encoding="utf-8"), requested_mode="parent"
+    )
+    assert edited_plan.parent is not None
+    assert edited_plan.children is not None
+
+    parent_body = _body_file(draft_dir / "parent.md", edited_plan.parent.body)
+    parent = gh.create_issue_record(
+        edited_plan.parent.title,
+        parent_body,
+        labels=[
+            config.issue_selection.ready_label,
+            config.issue_selection.parent_label,
+        ],
+    )
+
+    created_children = {}
+    for child in edited_plan.children:
+        child_body = _body_file(draft_dir / f"child-{child.key}.md", child.body)
+        created = gh.create_issue_record(
+            child.title,
+            child_body,
+            labels=[config.issue_selection.child_label],
+        )
+        created_children[child.key] = created
+        gh.add_sub_issue(parent.number, created.id)
+
+    for child in edited_plan.children:
+        created = created_children[child.key]
+        for blocker_key in child.blocked_by:
+            gh.add_blocked_by(created.number, created_children[blocker_key].id)
+
+    return parent.url
 
 
 def _read_description(args) -> str:
@@ -266,28 +510,46 @@ def _run_editor(path: Path, editor: str | None = None) -> None:
         raise RuntimeError(f"editor exited with status {result.returncode}")
 
 
-def _generate_issue_draft(config, repo_root: Path, description: str, title_hint: str, draft_dir: Path) -> tuple[str, str]:
+def _generate_issue_draft(
+    config,
+    repo_root: Path,
+    description: str,
+    title_hint: str,
+    draft_dir: Path,
+    mode: str = "auto",
+) -> IssueDraftPlan:
     prompt_path = draft_dir / "issue-draft.prompt.md"
     log_path = draft_dir / "issue-draft.log"
-    prompt_path.write_text(build_issue_draft_prompt(description, repo_root, config, title_hint=title_hint), encoding="utf-8")
+    prompt_path.write_text(
+        build_issue_draft_prompt(
+            description, repo_root, config, title_hint=title_hint, mode=mode
+        ),
+        encoding="utf-8",
+    )
     backend = CodexBackend(
         config.agent.command,
         log_path=log_path,
         model=config.agent.model,
         reasoning=config.agent.reasoning,
     )
-    result = backend.run(repo_root, prompt_path, timeout_sec=config.agent.timeout_minutes * 60)
+    result = backend.run(
+        repo_root, prompt_path, timeout_sec=config.agent.timeout_minutes * 60
+    )
     if not result.success:
-        detail = result.stderr.strip() or result.stdout.strip() or "agent failed without output"
+        detail = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or "agent failed without output"
+        )
         raise RuntimeError(f"issue draft generation failed: {detail}")
-    title, body = _parse_issue_draft_json(result.stdout)
-    if not title:
-        title = title_hint.strip()
-    if not title:
+    plan = _parse_issue_draft_json(result.stdout, requested_mode=mode)
+    if plan.kind == "single" and plan.issue and not plan.issue.title:
+        plan = IssueDraftPlan(
+            "single", issue=IssueDraft(title_hint.strip(), plan.issue.body)
+        )
+    if plan.kind == "single" and (plan.issue is None or not plan.issue.title):
         raise RuntimeError("agent returned an empty issue title")
-    if not body:
-        raise RuntimeError("agent returned an empty issue body")
-    return title, body
+    return plan
 
 
 def cmd_init(args) -> int:
@@ -305,7 +567,10 @@ def cmd_init(args) -> int:
         return 1
     print(f"created {args.path}")
     if repo == "owner/repo":
-        print("repo could not be inferred; edit repo in the config before running the worker", file=sys.stderr)
+        print(
+            "repo could not be inferred; edit repo in the config before running the worker",
+            file=sys.stderr,
+        )
         return 0
     if args.no_create_labels:
         return 0
@@ -323,7 +588,9 @@ def cmd_list(args) -> int:
     try:
         config = _load(args.config)
         gh = GHClient(config.repo)
-        issues = gh.list_issues([config.issue_selection.ready_label, config.issue_selection.resume_label])
+        issues = gh.list_issues(
+            [config.issue_selection.ready_label, config.issue_selection.resume_label]
+        )
         candidates = workable_issues(
             gh,
             issues,
@@ -335,10 +602,16 @@ def cmd_list(args) -> int:
         print(exc, file=sys.stderr)
         return 1
     if args.json:
-        print(json.dumps([issue.__dict__ for issue in candidates], indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                [issue.__dict__ for issue in candidates], indent=2, sort_keys=True
+            )
+        )
         return 0
     for issue in candidates:
-        print(f"#{issue.number}\t{issue.state}\t{issue.updated_at or ''}\t{','.join(issue.labels)}\t{issue.title}")
+        print(
+            f"#{issue.number}\t{issue.state}\t{issue.updated_at or ''}\t{','.join(issue.labels)}\t{issue.title}"
+        )
     return 0
 
 
@@ -347,22 +620,26 @@ def cmd_create(args) -> int:
         config = _load(args.config)
         description = _read_description(args).strip()
         if not description:
-            raise ConfigError("issue description is required; pass text, --description-file, or pipe stdin")
+            raise ConfigError(
+                "issue description is required; pass text, --description-file, or pipe stdin"
+            )
         title_hint = _derive_issue_title(description, args.title)
         draft_dir = Path(tempfile.mkdtemp(prefix="ai-issue-create-"))
-        draft_file = draft_dir / "issue.md"
+        draft_file = draft_dir / (
+            "issue-plan.json" if args.mode == "parent" else "issue.md"
+        )
         try:
-            title, body = _generate_issue_draft(config, Path.cwd(), description, title_hint, draft_dir)
-            draft_file.write_text(_render_issue_draft(title, body), encoding="utf-8")
-            if not args.no_edit:
-                _run_editor(draft_file, args.editor)
-            edited_title, edited_body = _parse_issue_draft_file(draft_file.read_text(encoding="utf-8"))
-            draft_file.write_text(f"{edited_body}\n", encoding="utf-8")
-            url = GHClient(config.repo).create_issue(
-                edited_title,
-                draft_file,
-                labels=[config.issue_selection.ready_label],
+            plan = _generate_issue_draft(
+                config, Path.cwd(), description, title_hint, draft_dir, mode=args.mode
             )
+            gh = GHClient(config.repo)
+            if plan.kind == "single":
+                url = _create_single_issue(config, gh, draft_file, plan, args)
+            else:
+                draft_file = draft_dir / "issue-plan.json"
+                url = _create_parent_issue(
+                    config, gh, draft_file, draft_dir, plan, args
+                )
         finally:
             shutil.rmtree(draft_dir, ignore_errors=True)
     except (ConfigError, GHError, RuntimeError) as exc:
@@ -373,7 +650,10 @@ def cmd_create(args) -> int:
 
 
 def cmd_run_once(args) -> int:
-    return run_once(Path(args.config), overrides=RunOverrides(model=args.model, reasoning=args.reasoning))
+    return run_once(
+        Path(args.config),
+        overrides=RunOverrides(model=args.model, reasoning=args.reasoning),
+    )
 
 
 def cmd_inspect(args) -> int:
@@ -391,11 +671,17 @@ def cmd_inspect(args) -> int:
         "lock_status": lock_status(paths["runtime_root"] / "worker.lock"),
         "worktree_root": str(paths["worktree_root"]),
         "run_root": str(paths["run_root"]),
-        "jobs": [job.to_dict() for job in jobs if args.issue is None or job.issue_number == args.issue],
+        "jobs": [
+            job.to_dict()
+            for job in jobs
+            if args.issue is None or job.issue_number == args.issue
+        ],
         "open_working_issues": [],
     }
     try:
-        working = GHClient(config.repo).list_issues(config.issue_selection.working_label)
+        working = GHClient(config.repo).list_issues(
+            config.issue_selection.working_label
+        )
         data["open_working_issues"] = [issue.__dict__ for issue in working]
     except GHError:
         pass
@@ -409,7 +695,9 @@ def cmd_inspect(args) -> int:
         print(f"run_root: {data['run_root']}")
         print("recent jobs:")
         for job in data["jobs"]:
-            print(f"  issue #{job['issue_number']}: {job['status']} {job['branch_name']}")
+            print(
+                f"  issue #{job['issue_number']}: {job['status']} {job['branch_name']}"
+            )
         if data["open_working_issues"]:
             print("open ai-working issues:")
             for issue in data["open_working_issues"]:
@@ -435,20 +723,47 @@ def cmd_start(args) -> int:
                 return 1
         except ValueError:
             pass
-    interval = args.interval_minutes if args.interval_minutes is not None else config.scheduler.interval_minutes
+    interval = (
+        args.interval_minutes
+        if args.interval_minutes is not None
+        else config.scheduler.interval_minutes
+    )
     if args.foreground:
         from .daemon import daemon_loop
 
-        return daemon_loop(Path(args.config), interval, model=args.model, reasoning=args.reasoning)
+        return daemon_loop(
+            Path(args.config), interval, model=args.model, reasoning=args.reasoning
+        )
     log_handle = log_file.open("a", encoding="utf-8")
-    command = [sys.executable, "-m", "ai_issue_worker.daemon", "--config", str(Path(args.config).resolve()), "--interval", str(interval)]
+    command = [
+        sys.executable,
+        "-m",
+        "ai_issue_worker.daemon",
+        "--config",
+        str(Path(args.config).resolve()),
+        "--interval",
+        str(interval),
+    ]
     if args.model:
         command.extend(["--model", args.model])
     if args.reasoning:
         command.extend(["--reasoning", args.reasoning])
-    proc = subprocess.Popen(command, cwd=Path.cwd(), stdout=log_handle, stderr=subprocess.STDOUT, start_new_session=True)
+    proc = subprocess.Popen(
+        command,
+        cwd=Path.cwd(),
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
     pid_file.write_text(str(proc.pid), encoding="utf-8")
-    write_status(status_file, running=True, pid=proc.pid, started_at=None, last_status="starting", log_file=str(log_file))
+    write_status(
+        status_file,
+        running=True,
+        pid=proc.pid,
+        started_at=None,
+        last_status="starting",
+        log_file=str(log_file),
+    )
     print(f"started worker pid {proc.pid}")
     return 0
 
@@ -508,7 +823,9 @@ def cmd_status(args) -> int:
     print(f"started_at: {status.get('started_at') or ''}")
     print(f"last_run_at: {status.get('last_run_at') or ''}")
     print(f"last_status: {status.get('last_status') or ''}")
-    print(f"log_file: {status.get('log_file') or str(paths['log_root'] / 'worker.log')}")
+    print(
+        f"log_file: {status.get('log_file') or str(paths['log_root'] / 'worker.log')}"
+    )
     return 0
 
 
@@ -554,7 +871,10 @@ def cmd_retry(args) -> int:
         print(exc, file=sys.stderr)
         return 1
     if args.run_now:
-        return run_once(Path(args.config), overrides=RunOverrides(model=args.model, reasoning=args.reasoning))
+        return run_once(
+            Path(args.config),
+            overrides=RunOverrides(model=args.model, reasoning=args.reasoning),
+        )
     print(f"issue #{args.issue} marked ready")
     return 0
 
@@ -566,7 +886,9 @@ def cmd_resume(args) -> int:
             gh = GHClient(config.repo)
             comment = _read_resume_comment(args).strip()
             if comment:
-                run_dir = issue_run_dir(_paths(config, Path.cwd())["run_root"], args.issue)
+                run_dir = issue_run_dir(
+                    _paths(config, Path.cwd())["run_root"], args.issue
+                )
                 comment_file = run_dir / "queued-resume-comment.md"
                 comment_file.parent.mkdir(parents=True, exist_ok=True)
                 comment_file.write_text(comment + "\n", encoding="utf-8")
@@ -598,12 +920,24 @@ def cmd_clean(args) -> int:
         return 1
     paths = _paths(config, Path.cwd())
     jobs = recent_jobs(paths["run_root"])
-    selected = [job for job in jobs if args.issue is None or job.issue_number == args.issue]
+    selected = [
+        job for job in jobs if args.issue is None or job.issue_number == args.issue
+    ]
     if args.failed:
-        selected = [job for job in selected if "failed" in job.status or job.status in {"verify_failed", "agent_failed", "diff_rejected"}]
+        selected = [
+            job
+            for job in selected
+            if "failed" in job.status
+            or job.status in {"verify_failed", "agent_failed", "diff_rejected"}
+        ]
     if args.older_than:
         cutoff = datetime.utcnow() - parse_age(args.older_than)
-        selected = [job for job in selected if (started := _parse_started_at(job.started_at)) is not None and started < cutoff]
+        selected = [
+            job
+            for job in selected
+            if (started := _parse_started_at(job.started_at)) is not None
+            and started < cutoff
+        ]
     for job in selected:
         worktree = Path(job.worktree_path)
         print(f"{'would remove' if args.dry_run else 'removing'} worktree {worktree}")
@@ -614,7 +948,9 @@ def cmd_clean(args) -> int:
                 print(f"failed to remove {worktree}: {exc}", file=sys.stderr)
                 continue
         run_dir = issue_run_dir(paths["run_root"], job.issue_number)
-        print(f"{'would remove' if args.dry_run else 'removing'} run directory {run_dir}")
+        print(
+            f"{'would remove' if args.dry_run else 'removing'} run directory {run_dir}"
+        )
         if not args.dry_run and run_dir.exists():
             shutil.rmtree(run_dir)
         if args.delete_local_branches and not args.dry_run:
@@ -629,9 +965,15 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init")
     init.add_argument("--path", default=DEFAULT_CONFIG_PATH)
     init.add_argument("--force", action="store_true")
-    init.add_argument("--repo", help="GitHub repository in owner/repo or host/owner/repo form")
+    init.add_argument(
+        "--repo", help="GitHub repository in owner/repo or host/owner/repo form"
+    )
     init.add_argument("--base-branch", help="base branch for worker pull requests")
-    init.add_argument("--no-create-labels", action="store_true", help="skip creating worker labels on GitHub")
+    init.add_argument(
+        "--no-create-labels",
+        action="store_true",
+        help="skip creating worker labels on GitHub",
+    )
     init.set_defaults(func=cmd_init)
 
     run = sub.add_parser("run-once")
@@ -652,6 +994,7 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--description-file")
     create.add_argument("--editor")
     create.add_argument("--no-edit", action="store_true")
+    create.add_argument("--mode", choices=CREATE_MODES, default="auto")
     create.set_defaults(func=cmd_create)
 
     inspect = sub.add_parser("inspect")
@@ -662,7 +1005,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     start = sub.add_parser("start")
     start.add_argument("--config", default=DEFAULT_CONFIG_PATH)
-    start.add_argument("--interval", dest="interval_minutes", type=parse_interval_minutes)
+    start.add_argument(
+        "--interval", dest="interval_minutes", type=parse_interval_minutes
+    )
     start.add_argument("--model")
     start.add_argument("--reasoning", choices=REASONING_EFFORTS)
     start.add_argument("--foreground", action="store_true")

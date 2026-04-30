@@ -65,18 +65,31 @@ issue_selection:
   respect_issue_dependencies: false
 ```
 
-Create a new AI-ready issue from rough local notes. The command sends your notes
-through the configured Codex agent to draft a formal title and Markdown body,
-opens that draft in your editor, then creates the GitHub issue with the
-configured ready label:
+Create new AI-ready issue work from rough local notes. The command sends your
+notes through the configured Codex agent to draft formal issue content, opens
+that draft in your editor, then creates GitHub issue records:
 
 ```bash
 ai-issue create --title "Fix parser crash" "Parser crashes when input is empty."
 ```
 
+By default, `--mode auto` lets Codex decide between one issue and a parent issue
+with sub-issues. Use `--mode single` to force one ready issue, or `--mode parent`
+to force an `ai-ready` + `ai-parent` tracking issue with `ai-child` sub-issues
+and native GitHub `blocked_by` dependency edges. Parent plans are edited as JSON;
+single issue drafts keep the `Title:` plus Markdown editor format.
+
 It uses the same `agent.command`, `agent.model`, and `agent.reasoning` settings
 as the worker. Use `--description-file path/to/issue.txt` for longer notes, or
 `--no-edit` for non-interactive scripts.
+
+When `run-once` selects a parent issue, it processes eligible child issues
+serially in separate Codex sessions and child PRs, up to
+`issue_selection.max_parent_children_per_run` per run. Parent runs write
+`parent-plan.json` and `parent-memory.md` under `.ai-runs/issue-<parent>/` so
+later child prompts include prior child summaries and decisions. Downstream child
+issues only run before blockers close when `issue_selection.allow_stacked_prs`
+allows the existing stacked-PR behavior.
 
 Run one local cycle:
 
